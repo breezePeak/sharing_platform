@@ -1,0 +1,12 @@
+.tools/
+.idea/
+**/.idea/
+**/target/
+.env
+.env.*
+!.env.example
+*.log
+data/
+*.dump
+*.pem
+*.key

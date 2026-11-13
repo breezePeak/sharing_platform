@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>请求未完成 · 数据共享平台</title><link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body><main>
+  <h1>请求未完成</h1><p th:text="${status}">错误</p>
+  <p th:text="${safeMessage ?: '页面不存在或请求暂时无法处理，请检查地址或联系管理员。'}">请稍后重试。</p>
+  <p>追踪编号：<code th:text="${traceId ?: '请提供响应头 X-Trace-Id'}"></code></p>
+  <a th:href="@{/services}">返回当前服务</a>
+</main></body>
+</html>

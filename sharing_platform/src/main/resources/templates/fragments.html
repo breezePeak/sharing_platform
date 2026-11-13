@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<body>
+<header th:fragment="navigation">
+  <a class="brand" th:href="@{/services}">数据共享平台</a>
+  <nav aria-label="主要导航">
+    <a th:href="@{/services}">当前服务</a>
+    <a th:href="@{/config}">平台配置</a>
+    <a th:href="@{/tasks}">任务记录</a>
+  </nav>
+</header>
+</body>
+</html>

@@ -1,0 +1,8 @@
+# 测试必须显式传入独立库，不能继承开发库的 DB_* 参数。
+spring:
+  datasource:
+    url: ${TEST_DB_URL:}
+    username: ${TEST_DB_USERNAME:}
+    password: ${TEST_DB_PASSWORD:}
+server:
+  address: 127.0.0.1

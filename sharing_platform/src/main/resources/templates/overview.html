@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title th:text="${title} + ' · 数据共享平台'">数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <p class="eyebrow">平台工作台</p><h1 th:text="${title}">当前服务</h1>
+  <section class="empty" aria-label="当前功能状态">
+    <h2>平台基础导航</h2><p th:text="${message}">暂无记录。</p>
+  </section>
+</main>
+</body>
+</html>

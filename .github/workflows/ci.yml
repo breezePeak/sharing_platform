@@ -1,0 +1,63 @@
+name: Java and PostgreSQL foundation
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sharing_platform
+    env:
+      PG_VERSION: '13.23'
+      PGPORT: '55432'
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+      TEST_DB_URL: jdbc:postgresql://127.0.0.1:55432/sharing_platform_test
+      TEST_DB_USERNAME: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: maven
+          cache-dependency-path: sharing_platform/pom.xml
+      # Start an isolated native server; no Docker service or customer database.
+      - name: Build and start pinned PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 -O "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2"
+          curl --fail --location --retry 3 -O "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2.sha256"
+          sha256sum --check "postgresql-${PG_VERSION}.tar.bz2.sha256"
+          tar -xf "postgresql-${PG_VERSION}.tar.bz2"
+          cd "postgresql-${PG_VERSION}"
+          ./configure --prefix="$RUNNER_TEMP/pgsql" --without-readline --without-zlib > "$RUNNER_TEMP/pg-configure.log"
+          make -j2 > "$RUNNER_TEMP/pg-build.log"
+          make install > "$RUNNER_TEMP/pg-install.log"
+          test_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$test_password"
+          echo "TEST_DB_PASSWORD=$test_password" >> "$GITHUB_ENV"
+          export PGPASSWORD="$test_password"
+          printf '%s\n' "$test_password" > "$RUNNER_TEMP/pg-password"
+          chmod 600 "$RUNNER_TEMP/pg-password"
+          "$RUNNER_TEMP/pgsql/bin/initdb" -D "$RUNNER_TEMP/pgdata" -U postgres --auth=scram-sha-256 --pwfile="$RUNNER_TEMP/pg-password"
+          "$RUNNER_TEMP/pgsql/bin/pg_ctl" -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/postgres.log" -o "-h 127.0.0.1 -p $PGPORT" -w start
+          "$RUNNER_TEMP/pgsql/bin/createdb" sharing_platform_test
+      - name: Compile, unit test, package and run real database integration tests
+        run: sh ./mvnw -B clean verify
+      - name: Stop test database
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/pgdata/postmaster.pid" ]; then
+            "$RUNNER_TEMP/pgsql/bin/pg_ctl" -D "$RUNNER_TEMP/pgdata" -m fast -w stop
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            sharing_platform/target/surefire-reports/
+            sharing_platform/target/failsafe-reports/
