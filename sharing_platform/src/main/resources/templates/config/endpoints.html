@@ -1,42 +1,132 @@
 <!DOCTYPE html>
 <html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>连接配置 · 数据共享平台</title><link rel="stylesheet" th:href="@{/css/app.css}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>连接配置 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
 </head>
-<body><header th:replace="~{fragments :: navigation}"></header>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
 <main>
-  <p class="eyebrow">平台配置</p><h1>FTP / SFTP 连接</h1>
-  <p><a class="button" th:href="@{/config/endpoints/new}">新增连接</a></p>
-  <p>检测异步执行，刷新页面查看结果。旧版本结果不代表当前配置可用，每次任务仍需预检查。监听与任务业务尚未开放。</p>
-  <p>读源检测只表示配置的读取测试对象已通过；写入目标的回读仅用于目标完整性验证，两者互不替代。</p>
-  <section class="empty" th:if="${#lists.isEmpty(rows)}"><h2>暂无连接</h2><p>新增连接后可检测实际读写、回读校验及重命名能力。</p></section>
-  <article class="panel" th:each="row : ${rows}">
-    <h2><a th:href="@{/config/endpoints/{id}(id=${row.id})}" th:text="${row.name}">连接</a></h2>
-    <p><span th:text="${row.protocol}"></span> · <span th:text="${row.host}"></span>:<span th:text="${row.port}"></span>
-      · 版本 <span th:text="${row.revision}"></span> · <strong th:text="${row.enabled ? '已启用' : '已停用'}"></strong></p>
-    <p>连接编号：<code th:text="${row.id}"></code></p>
-    <div class="actions">
-      <form method="post" th:action="@{/config/endpoints/{id}/toggle(id=${row.id})}">
-        <input type="hidden" name="_csrf" th:value="${csrfToken}"><input type="hidden" name="revision" th:value="${row.revision}">
-        <button th:text="${row.enabled ? '停用' : '启用'}"></button>
-      </form>
-      <form method="post" th:action="@{/config/endpoints/{id}/probe(id=${row.id})}">
-        <input type="hidden" name="_csrf" th:value="${csrfToken}"><input type="hidden" name="revision" th:value="${row.revision}">
-        <button th:disabled="${!row.enabled}">检测能力</button>
-      </form>
+  <div class="page-header">
+    <div>
+      <p class="eyebrow">平台配置 · ENDPOINT REGISTRY</p>
+      <h1>FTP / SFTP 连接管理</h1>
     </div>
-    <p th:if="${row.probe == null}">健康：UNKNOWN（尚未检测）。容量：UNKNOWN。</p>
-    <section th:if="${row.probe != null}" aria-label="最近检测">
-      <p th:if="${row.stale}" class="notice">检测已过期：以下属于旧配置版本，请重新检测。</p>
-      <p>检测时间 <span th:text="${row.probe.startedAt}"></span> · 状态 <strong th:text="${row.probe.status}"></strong>
-        · 检测版本编号 <code th:text="${row.probe.revisionId}"></code></p>
-      <p>读源检测 <span th:text="${row.probe.canRead}"></span> · 写入 <span th:text="${row.probe.canWrite}"></span>
-        · 写入目标完整性 <span th:text="${row.probe.verified}"></span> · 重命名 <span th:text="${row.probe.canRename}"></span>
-        · 容量 <span th:text="${row.probe.capacity}"></span></p>
-      <p th:if="${!row.stale}" th:text="${row.probe.strictPush ? '满足本次探测的严格推送条件' : '尚不满足严格推送条件；只读连接可单独用于拉取'}"></p>
-      <details><summary>阶段与原因</summary><pre th:text="${row.probe.details}"></pre></details>
-      <p class="notice" th:if="${!#strings.isEmpty(row.probe.residuals)}">残留或创建结果未知的路径（人工核对归属后处理）：</p>
+    <div class="actions">
+      <a class="button" th:href="@{/config/endpoints/new}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        <span>新增连接</span>
+      </a>
+    </div>
+  </div>
+
+  <div class="callout" role="region" aria-label="探测与校验准则">
+    <div class="callout-item">
+      <svg class="callout-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+      </svg>
+      <p>
+        <strong>异步能力探测与版本绑定</strong>
+        检测异步执行，刷新页面查看结果。旧版本结果不代表当前配置可用，每次任务仍需预检查。监听与任务业务尚未开放。
+      </p>
+    </div>
+    <div class="callout-item">
+      <svg class="callout-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      </svg>
+      <p>
+        <strong>读写职责严格分离</strong>
+        读源检测只表示配置的读取测试对象已通过；写入目标的回读仅用于目标完整性验证，两者互不替代。
+      </p>
+    </div>
+  </div>
+
+  <section class="empty" th:if="${#lists.isEmpty(rows)}">
+    <div class="empty-icon-box" aria-hidden="true">
+      <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>
+      </svg>
+    </div>
+    <h2>暂无已注册的 FTP / SFTP 连接</h2>
+    <p>新增远端连接节点后，可执行真实读写探测、SHA-256 回读完整性校验及原子重命名能力验证。</p>
+    <div class="actions" style="justify-content: center; margin-top: 1.5rem;">
+      <a class="button" th:href="@{/config/endpoints/new}">+ 立即新增连接</a>
+    </div>
+  </section>
+
+  <article class="endpoint-card" th:each="row : ${rows}">
+    <div class="endpoint-card-header">
+      <div>
+        <div class="endpoint-title-row">
+          <span class="badge badge-protocol" th:text="${row.protocol}">FTP</span>
+          <h2><a th:href="@{/config/endpoints/{id}(id=${row.id})}" th:text="${row.name}">连接</a></h2>
+          <span th:class="${row.enabled ? 'badge badge-enabled' : 'badge badge-disabled'}"
+                th:text="${row.enabled ? '已启用' : '已停用'}">已启用</span>
+        </div>
+        <div class="endpoint-meta">
+          <span class="host-pill"><strong th:text="${row.host}">127.0.0.1</strong>:<span th:text="${row.port}">21</span></span>
+          <span class="meta-sep">|</span>
+          <span>修订版本 <strong>v<span th:text="${row.revision}">1</span></strong></span>
+          <span class="meta-sep">|</span>
+          <span>连接编号：<code th:text="${row.id}"></code></span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <a class="button button-secondary" th:href="@{/config/endpoints/{id}(id=${row.id})}">编辑配置</a>
+        <form method="post" th:action="@{/config/endpoints/{id}/toggle(id=${row.id})}">
+          <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="revision" th:value="${row.revision}">
+          <button class="button-secondary" th:text="${row.enabled ? '停用' : '启用'}">停用</button>
+        </form>
+        <form method="post" th:action="@{/config/endpoints/{id}/probe(id=${row.id})}">
+          <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="revision" th:value="${row.revision}">
+          <button th:disabled="${!row.enabled}">检测能力</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="probe-section" th:if="${row.probe == null}">
+      <div class="probe-unknown-bar">
+        <span>健康状态：<strong>UNKNOWN</strong>（尚未执行探测）</span>
+        <span>远端容量：<strong>UNKNOWN</strong></span>
+      </div>
+    </div>
+
+    <section class="probe-section" th:if="${row.probe != null}" aria-label="最近检测">
+      <p th:if="${row.stale}" class="notice" style="margin-top:0;">检测已过期：以下属于旧配置版本，请重新检测。</p>
+      <div class="probe-header-bar">
+        <span>最近探测时间：<strong th:text="${row.probe.startedAt}"></strong></span>
+        <span>执行状态：<strong th:text="${row.probe.status}"></strong></span>
+        <span>探测快照编号：<code th:text="${row.probe.revisionId}"></code></span>
+      </div>
+
+      <div class="probe-metrics">
+        <div class="metric-item" th:classappend="${row.probe.canRead ? 'metric-pass' : 'metric-fail'}">读源检测 <span th:text="${row.probe.canRead}"></span></div>
+        <div class="metric-item" th:classappend="${row.probe.canWrite ? 'metric-pass' : 'metric-fail'}">写入 <span th:text="${row.probe.canWrite}"></span></div>
+        <div class="metric-item" th:classappend="${row.probe.verified ? 'metric-pass' : 'metric-fail'}">写入目标完整性 <span th:text="${row.probe.verified}"></span></div>
+        <div class="metric-item" th:classappend="${row.probe.canRename ? 'metric-pass' : 'metric-fail'}">重命名 <span th:text="${row.probe.canRename}"></span></div>
+        <div class="metric-item">容量 <span th:text="${row.probe.capacity}"></span></div>
+      </div>
+
+      <p th:if="${!row.stale}"
+         th:class="${row.probe.strictPush ? 'strict-verdict verdict-pass' : 'strict-verdict verdict-readonly'}"
+         th:text="${row.probe.strictPush ? '满足本次探测的严格推送条件' : '尚不满足严格推送条件；只读连接可单独用于拉取'}"></p>
+
+      <details>
+        <summary>查看探测阶段明细与诊断日志</summary>
+        <pre th:text="${row.probe.details}"></pre>
+      </details>
+
+      <p class="notice" th:if="${!#strings.isEmpty(row.probe.residuals)}" style="margin-top:0.85rem;">残留或创建结果未知的路径（人工核对归属后处理）：</p>
       <pre th:if="${!#strings.isEmpty(row.probe.residuals)}" th:text="${row.probe.residuals}"></pre>
     </section>
   </article>
-</main></body></html>
+</main>
+</body>
+</html>

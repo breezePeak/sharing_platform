@@ -1,40 +1,129 @@
 <!DOCTYPE html>
 <html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>编辑连接 · 数据共享平台</title><link rel="stylesheet" th:href="@{/css/app.css}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>编辑连接 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
 </head>
-<body><header th:replace="~{fragments :: navigation}"></header><main>
-  <p><a th:href="@{/config/endpoints}">返回连接列表</a></p><h1 th:text="${endpointId == null ? '新增连接' : '编辑连接'}"></h1>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header">
+    <div>
+      <p class="eyebrow">平台配置 · ENDPOINT CONFIGURATION</p>
+      <h1 th:text="${endpointId == null ? '新增连接' : '编辑连接'}">编辑连接</h1>
+    </div>
+    <div class="actions">
+      <a class="button button-secondary" th:href="@{/config/endpoints}">← 返回连接列表</a>
+    </div>
+  </div>
+
   <form class="panel fields" method="post" th:action="${endpointId == null ? '/config/endpoints' : '/config/endpoints/' + endpointId}" th:object="${form}">
-    <input type="hidden" name="_csrf" th:value="${csrfToken}"><input type="hidden" th:field="*{revision}">
+    <input type="hidden" name="_csrf" th:value="${csrfToken}">
+    <input type="hidden" th:field="*{revision}">
+
     <p class="notice" th:if="${#fields.hasAnyErrors()}">参数无效，请检查必填项、范围及协议选项。密码不会回显，请按需重新输入。</p>
     <p class="notice" th:if="${validationMessage != null}" th:text="${validationMessage}"></p>
-    <label>名称<input th:field="*{name}" required maxlength="100"></label>
-    <label>协议<select th:field="*{protocol}"><option value="FTP">FTP</option><option value="SFTP">SFTP</option></select></label>
-    <label>主机（不含协议或路径）<input th:field="*{host}" required maxlength="253" autocomplete="off"></label>
-    <label>端口（FTP 通常 21，SFTP 通常 22）<input type="number" th:field="*{port}" required min="1" max="65535"></label>
-    <label>用户名<input th:field="*{username}" required maxlength="100" autocomplete="off"></label>
-    <label>认证<select th:field="*{auth}"><option value="PASSWORD">密码</option><option value="KEY">SFTP 私钥</option></select></label>
-    <label>新密码 / 私钥口令<input type="password" name="password" maxlength="4096" autocomplete="new-password"></label>
-    <p>留空保留原凭据。秘密从不回显；清除使用下方独立操作。<span th:if="${hasCredential == true}">已保存加密凭据。</span></p>
-    <label>SFTP 私钥文件名（仅管理员受限目录）<input th:field="*{keyFile}" maxlength="100"></label>
-    <label>SFTP 可信主机指纹（预先通过可信渠道取得 SHA256:…）<input th:field="*{fingerprint}" maxlength="100"></label>
-    <label>远端读取根目录（绝对路径，可留空）<input th:field="*{readRoot}" maxlength="1000"></label>
-    <label>读取测试对象（相对读取根目录，非空普通文件）<input th:field="*{readTestFile}" maxlength="500"></label>
-    <label>远端写入根目录（绝对路径，可留空）<input th:field="*{writeRoot}" maxlength="1000"></label>
-    <label>写探测子目录（相对写入根目录，须事先存在；留空不写探测）<input th:field="*{probeDirectory}" maxlength="500"></label>
-    <label>本地源根目录引用（由管理员外置配置，可留空）<input th:field="*{localSourceRef}" maxlength="100"></label>
-    <label>本地目标根目录引用（由管理员外置配置，可留空）<input th:field="*{localTargetRef}" maxlength="100"></label>
-    <label>单阶段超时（秒，检测总时限为其 6 倍）<input type="number" th:field="*{timeoutSeconds}" min="1" max="30" required></label>
-    <label>连接并发上限（检测还受全局 2 个会话限制）<input type="number" th:field="*{concurrency}" min="1" max="8" required></label>
-    <label class="check"><input type="checkbox" th:field="*{passive}">FTP 被动模式</label>
-    <label class="check"><input type="checkbox" th:field="*{isolatedFtpRoot}">FTP 管理员已隔离账号根目录；FTP 无法严格证明远端无链接</label>
-    <label class="check"><input type="checkbox" th:field="*{enabled}">启用（停用拒绝新检测 / 未来新任务，保留配置与历史）</label>
-    <button type="submit">保存连接</button>
+
+    <div class="form-section">
+      <div class="form-section-aside">
+        <span class="form-section-step">SECTION 01</span>
+        <h2 class="form-section-title">基本连接信息</h2>
+        <p class="form-section-desc">定义远端文件服务节点的标识名称、传输协议类型及网络可达地址。</p>
+      </div>
+      <div class="form-grid">
+        <label>连接名称<input th:field="*{name}" required maxlength="100" placeholder="例如：省应急管理厅前置交换节点"></label>
+        <label>传输协议
+          <select th:field="*{protocol}">
+            <option value="FTP">FTP（文件传输协议）</option>
+            <option value="SFTP">SFTP（SSH 安全文件传输）</option>
+          </select>
+        </label>
+        <label>主机地址（不含协议或路径）<input th:field="*{host}" required maxlength="253" autocomplete="off" placeholder="例如：10.20.30.40 或 sftp.example.gov.cn"></label>
+        <label>服务端口（FTP 默认 21，SFTP 默认 22）<input type="number" th:field="*{port}" required min="1" max="65535"></label>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <div class="form-section-aside">
+        <span class="form-section-step">SECTION 02</span>
+        <h2 class="form-section-title">身份认证与安全凭据</h2>
+        <p class="form-section-desc">敏感凭据采用 AES-GCM 加密持久化，页面绝不回显明文。SFTP 强制要求预先核验主机指纹以防中间人攻击。</p>
+      </div>
+      <div>
+        <div class="form-grid">
+          <label>登录用户名<input th:field="*{username}" required maxlength="100" autocomplete="off"></label>
+          <label>认证方式
+            <select th:field="*{auth}">
+              <option value="PASSWORD">密码认证 (PASSWORD)</option>
+              <option value="KEY">SFTP 私钥认证 (KEY)</option>
+            </select>
+          </label>
+          <label>新密码 / 私钥口令<input type="password" name="password" maxlength="4096" autocomplete="new-password" placeholder="留空则沿用已保存的加密凭据"></label>
+          <label>SFTP 私钥文件名（仅限受管密钥目录）<input th:field="*{keyFile}" maxlength="100" placeholder="例如：id_ed25519_partner"></label>
+        </div>
+        <p class="field-hint">
+          留空保留原凭据。秘密从不回显；清除使用下方独立操作。
+          <strong th:if="${hasCredential == true}" style="color: var(--emerald-700);">● 当前版本已保存加密凭据</strong>
+        </p>
+        <label class="form-full">SFTP 可信主机指纹（预先通过可信渠道取得 SHA256:…）<input th:field="*{fingerprint}" maxlength="100" placeholder="例如：SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"></label>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <div class="form-section-aside">
+        <span class="form-section-step">SECTION 03</span>
+        <h2 class="form-section-title">远端与本地路径映射</h2>
+        <p class="form-section-desc">严格限定远端读写根目录边界与本地受管目录别名，防止目录穿越与越权访问。</p>
+      </div>
+      <div class="form-grid">
+        <label>远端读取根目录（绝对路径，可留空）<input th:field="*{readRoot}" maxlength="1000" placeholder="例如：/data/outbound"></label>
+        <label>读取测试对象（相对读取根目录，非空普通文件）<input th:field="*{readTestFile}" maxlength="500" placeholder="例如：healthcheck/sample.bin"></label>
+        <label>远端写入根目录（绝对路径，可留空）<input th:field="*{writeRoot}" maxlength="1000" placeholder="例如：/data/inbound"></label>
+        <label>写探测子目录（相对写入根目录，须事先存在；留空不写探测）<input th:field="*{probeDirectory}" maxlength="500" placeholder="例如：.probe"></label>
+        <label>本地源根目录引用（由管理员外置配置，可留空）<input th:field="*{localSourceRef}" maxlength="100" placeholder="例如：default-source"></label>
+        <label>本地目标根目录引用（由管理员外置配置，可留空）<input th:field="*{localTargetRef}" maxlength="100" placeholder="例如：default-target"></label>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <div class="form-section-aside">
+        <span class="form-section-step">SECTION 04</span>
+        <h2 class="form-section-title">超时、并发与协议策略</h2>
+        <p class="form-section-desc">控制单阶段 I/O 超时时限、单节点并发连接上限及 FTP 安全隔离策略。</p>
+      </div>
+      <div>
+        <div class="form-grid">
+          <label>单阶段超时（秒，检测总时限为其 6 倍）<input type="number" th:field="*{timeoutSeconds}" min="1" max="30" required></label>
+          <label>连接并发上限（检测还受全局 2 个会话限制）<input type="number" th:field="*{concurrency}" min="1" max="8" required></label>
+        </div>
+        <div class="check-group">
+          <label class="check"><input type="checkbox" th:field="*{passive}"><span>启用 FTP 被动模式（PASV，推荐穿越防火墙环境开启）</span></label>
+          <label class="check"><input type="checkbox" th:field="*{isolatedFtpRoot}"><span>确认 FTP 管理员已隔离账号根目录（FTP 协议无法由客户端严格证明远端无符号链接）</span></label>
+          <label class="check"><input type="checkbox" th:field="*{enabled}"><span>启用此连接（停用后拒绝新检测与新传输任务，保留历史版本快照）</span></label>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-footer">
+      <a class="button button-secondary" th:href="@{/config/endpoints}">取消</a>
+      <button type="submit">保存连接配置</button>
+    </div>
   </form>
-  <form class="panel" th:if="${endpointId != null}" method="post" th:action="@{/config/endpoints/{id}/clear-credential(id=${endpointId})}">
-    <h2>清除当前凭据</h2><p>新增一个不含密码、私钥引用及口令的配置版本，旧版本保留供历史引用。此操作不删除外置私钥文件。</p>
-    <input type="hidden" name="_csrf" th:value="${csrfToken}"><input type="hidden" name="revision" th:value="${form.revision}">
-    <label>输入 CLEAR 确认<input name="confirmation" required pattern="CLEAR" autocomplete="off"></label><button>清除凭据</button>
+
+  <form class="panel danger-zone" th:if="${endpointId != null}" method="post" th:action="@{/config/endpoints/{id}/clear-credential(id=${endpointId})}">
+    <div class="danger-zone-info">
+      <h2>清除当前保存的加密凭据</h2>
+      <p>生成一个新的不含密码、私钥引用及口令的配置修订版本，旧版本快照保留供历史任务审计引用。此操作不会删除服务器外置私钥文件。</p>
+    </div>
+    <input type="hidden" name="_csrf" th:value="${csrfToken}">
+    <input type="hidden" name="revision" th:value="${form.revision}">
+    <div class="danger-zone-controls">
+      <label>输入 CLEAR 确认清除<input name="confirmation" required pattern="CLEAR" autocomplete="off" placeholder="请输入 CLEAR"></label>
+      <button class="button-danger">立即清除凭据</button>
+    </div>
   </form>
-</main></body></html>
+</main>
+</body>
+</html>

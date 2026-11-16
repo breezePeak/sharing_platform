@@ -1,13 +1,35 @@
 <!DOCTYPE html>
 <html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>请求未完成 · 数据共享平台</title><link rel="stylesheet" th:href="@{/css/app.css}">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>请求未完成 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
 </head>
-<body><main>
-  <h1>请求未完成</h1><p th:text="${status}">错误</p>
-  <p th:text="${safeMessage ?: '页面不存在或请求暂时无法处理，请检查地址或联系管理员。'}">请稍后重试。</p>
-  <p>追踪编号：<code th:text="${traceId ?: '请提供响应头 X-Trace-Id'}"></code></p>
-  <a th:href="@{/services}">返回当前服务</a>
-</main></body>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <section class="error-card" aria-label="错误提示">
+    <div class="error-card-body">
+      <div class="error-icon-wrap" aria-hidden="true">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/>
+          <line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+      </div>
+      <span class="error-status-pill">HTTP <span th:text="${status}">错误</span></span>
+      <h1>请求未完成</h1>
+      <p th:text="${safeMessage ?: '页面不存在或请求暂时无法处理，请检查地址或联系管理员。'}">请稍后重试。</p>
+      <div class="error-trace-box">
+        <span>追踪编号：<code th:text="${traceId ?: '请提供响应头 X-Trace-Id'}"></code></span>
+      </div>
+    </div>
+    <div class="error-card-footer">
+      <a class="button" th:href="@{/services}">返回当前服务</a>
+      <a class="button button-secondary" th:href="@{/config/endpoints}">查看连接配置</a>
+    </div>
+  </section>
+</main>
+</body>
 </html>

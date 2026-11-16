@@ -1,16 +1,141 @@
 <!DOCTYPE html>
 <html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title th:text="${title} + ' · 数据共享平台'">数据共享平台</title>
   <link rel="stylesheet" th:href="@{/css/app.css}">
 </head>
 <body>
 <header th:replace="~{fragments :: navigation}"></header>
 <main>
-  <p class="eyebrow">平台工作台</p><h1 th:text="${title}">当前服务</h1>
-  <section class="empty" aria-label="当前功能状态">
-    <h2>平台基础导航</h2><p th:text="${message}">暂无记录。</p>
+  <section class="console-banner" aria-label="当前功能状态">
+    <div class="console-banner-main">
+      <div>
+        <p class="eyebrow">平台工作台 · SYSTEM OVERVIEW</p>
+        <h1 th:text="${title}">当前服务</h1>
+        <p class="console-lead" th:text="${message}">暂无记录。</p>
+        <div class="console-QuickSpecs">
+          <div class="spec-chip">
+            <span>支持协议：</span>
+            <strong>FTP / SFTP</strong>
+          </div>
+          <div class="spec-chip">
+            <span>凭据保护：</span>
+            <strong>AES-GCM 加密留痕</strong>
+          </div>
+          <div class="spec-chip">
+            <span>探测并发上限：</span>
+            <strong>2 会话有界隔离</strong>
+          </div>
+        </div>
+      </div>
+      <div class="actions">
+        <a class="button" th:href="@{/config/endpoints}">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>
+          </svg>
+          <span>管理 FTP / SFTP 连接</span>
+        </a>
+        <a class="button button-secondary" th:href="@{/config/endpoints/new}">+ 新增传输连接</a>
+      </div>
+    </div>
+
+    <aside class="topology-box" aria-label="安全交换链路拓扑">
+      <div class="topology-header">
+        <span> DATA EXCHANGE PIPELINE</span>
+        <span>STRICT-VERIFY</span>
+      </div>
+      <div class="topology-steps">
+        <div class="topo-node">
+          <span class="topo-step-id">STAGE 01</span>
+          <div class="topo-node-text">
+            <strong>连接建立与指纹核验</strong>
+            <span>SFTP 主机 SHA-256 指纹强校验 / FTP 隔离根与被动数据通道探测</span>
+          </div>
+        </div>
+        <div class="topo-node">
+          <span class="topo-step-id">STAGE 02</span>
+          <div class="topo-node-text">
+            <strong>读写探测与回读校验</strong>
+            <span>独立验证读源测试对象、目标写入及字节级 SHA-256 回读完整性</span>
+          </div>
+        </div>
+        <div class="topo-node">
+          <span class="topo-step-id">STAGE 03</span>
+          <div class="topo-node-text">
+            <strong>原子重命名与痕迹清理</strong>
+            <span>验证临时文件重命名就绪能力并自动清理探测探针，异常残留显式告警</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </section>
+
+  <div class="section-label">
+    <h2>子系统能力矩阵 · MODULE MATRIX</h2>
+  </div>
+
+  <section class="feature-grid" aria-label="平台能力规划">
+    <article class="feature-card feature-card-active">
+      <div>
+        <div class="feature-card-top">
+          <span class="feature-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+          </span>
+          <span class="feature-card-tag tag-active">● 已就绪</span>
+        </div>
+        <h2>FTP / SFTP 连接管理与探测</h2>
+        <p>支持加密凭据存储、配置版本修订留痕、异步连通性探测及读写回读完整性校验。</p>
+      </div>
+      <ul class="feature-meta-list">
+        <li>REVISION-SNAPSHOT</li>
+        <li>STRICT-PUSH-CHECK</li>
+        <li>BOUNDED-PROBE</li>
+      </ul>
+    </article>
+
+    <article class="feature-card feature-card-planned">
+      <div>
+        <div class="feature-card-top">
+          <span class="feature-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </span>
+          <span class="feature-card-tag tag-planned">尚未开放</span>
+        </div>
+        <h2>目录监听与自动触发</h2>
+        <p>面向本地源目录与远端读取根目录的多目标独立定时扫描、版本去重与自动调度能力正在建设中。</p>
+      </div>
+      <ul class="feature-meta-list">
+        <li>MULTI-WATCHER</li>
+        <li>VERSION-DEDUP</li>
+        <li>ISOLATED-SCAN</li>
+      </ul>
+    </article>
+
+    <article class="feature-card feature-card-planned">
+      <div>
+        <div class="feature-card-top">
+          <span class="feature-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+            </svg>
+          </span>
+          <span class="feature-card-tag tag-planned">尚未开放</span>
+        </div>
+        <h2>服务运行与任务追踪面板</h2>
+        <p>可视化展示推送与拉取任务进度、阶段耗时、回调投递状态及验收回执闭环的监控视图尚未开放。</p>
+      </div>
+      <ul class="feature-meta-list">
+        <li>PUSH-READY-PUBLISH</li>
+        <li>PULL-DELIVERY-ACK</li>
+        <li>AUDIT-TRAIL</li>
+      </ul>
+    </article>
   </section>
 </main>
 </body>
