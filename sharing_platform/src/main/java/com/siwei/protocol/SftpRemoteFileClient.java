@@ -73,7 +73,8 @@ final class SftpRemoteFileClient extends ScopedRemoteClient {
         try (SftpClient.CloseableHandle handle = sftp.openDir(path)) {
             List<SftpClient.DirEntry> batch;
             while ((batch = sftp.readDir(handle)) != null) {
-                for (SftpClient.DirEntry e : batch) entries.add(entry(e.getFilename(), e.getAttributes()));
+                for (SftpClient.DirEntry e : batch) if (!e.getFilename().equals(".") && !e.getFilename().equals(".."))
+                    entries.add(entry(e.getFilename(), e.getAttributes()));
             }
         }
         return entries;

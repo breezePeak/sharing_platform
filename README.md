@@ -1,6 +1,6 @@
 # 数据共享平台
 
-工程位于 `sharing_platform/`。使用 **JDK 11 / Spring Boot 2.7.18、Spring Data JPA、直接连接 PostgreSQL、页面无需登录**，不引入 Spring Security。PR2 新增 FTP/SFTP 连接配置、版本化加密凭据和异步真实能力检测；PR3 新增任务接入骨架与通知队列。真实推送、拉取及监听仍未开放，未装配处理器的方向返回 503。
+工程位于 `sharing_platform/`。使用 **JDK 11 / Spring Boot 2.7.18、Spring Data JPA、直接连接 PostgreSQL、页面无需登录**，不引入 Spring Security。PR2 新增 FTP/SFTP 连接配置、版本化加密凭据和异步真实能力检测；PR3 新增任务接入骨架与通知队列；PR4 接入真实 PUSH。PULL 与监听仍未开放，未装配处理器的方向返回 503。
 
 ## 环境与数据库准备
 
@@ -34,6 +34,8 @@ $env:TEST_DB_PASSWORD = Read-Host '独立测试库密码' -MaskInput
 .\mvnw.cmd clean verify
 java -jar target/sharing_platform-1.0-SNAPSHOT.jar --spring.profiles.active=local
 ```
+
+本机开发可在仓库根目录执行 `. ./.env.local.ps1` 载入用户提供的数据库参数；该文件被 Git 忽略，不用于生产部署。
 
 Unix 使用 `sh ./mvnw clean verify`；环境变量含义相同。`package` 只执行单元/页面测试，完整验收必须使用 `verify`，其后运行真实数据库集成测试。数据库不可达、迁移冲突或缺少配置时启动失败，不回退到其他数据库。
 
@@ -71,9 +73,15 @@ platform:
 
 FTP 总超时会关闭实际的数据 socket（包括读、写、列举及主动模式监听）和控制连接，持续有数据也不能绕过总时限；适配器不关闭调用方传入的流。`canRead` / 页面“读源检测”仅表示 `readRoot/readTestFile` 通过读取检测；写入探测文件回读成功只设置目标完整性结果。读源失败或未检测时可仍满足严格推送条件，但不能显示读取成功。
 
+## PR4 推送
+
+PUSH 使用现有 Bearer 调用方、endpoint 授权和通知配置。连接须设置可写远端根目录、已存在的探测目录及本地源根目录引用。调用方先提交产品目录；预检固定每个文件的大小和 SHA-256，实际探测目标读写能力，通知接收端确认 PRECHECK 后才传输业务文件。目标业务文件完整回读核验，`_manifest.xml` 验证后才写入并核对 `_READY`。完成通知保留全部原产品和相对交付路径。接口字段与示例见 [任务契约](doc/contracts/transfer-api.md)。
+
+默认拒绝零字节文件以及 `.tmp`、`.part`、`.crdownload` 文件；可在外置配置中使用 `platform.transfers.allow-zero-byte-files` 和 `platform.transfers.temporary-suffixes` 调整。生产方下发任务须代表其固定版本已就绪；无上游预期清单时，平台只能证明所观察集合固定，无法证明上游未漏生成文件。接收方按有效 `_READY` 和匹配的清单消费，需在联调中确认。关闭新 PUSH 受理可设置 `platform.transfers.push-intake-enabled=false`，处理器继续完成在途任务及通知，已发布数据保留；旧版本不能识别新状态时不可直接降级执行器。
+
 ## 测试、迁移与回退
 
-纯单元/页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`，不需要数据库。`./mvnw clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`；默认 URL 数据库名须以 `_test` 结尾，禁止 URL 内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权在本机应用库验收时，额外设置 `TEST_DB_ALLOW_LOCAL=true`，才允许回环地址上与 `DB_URL` 相同的非系统数据库。每次测试创建随机 `foundation_it_*` / `endpoint_it_*` / `task_it_*` schema，只删除本次随机 schema，不清空数据库或修改现有业务 schema。真实协议服务仅监听回环地址，使用临时目录和测试凭据。测试覆盖 V1→V3 增量迁移、JPA、重启保留、测试专用 V4 升级、页面防伪、双协议能力、任务幂等、领取、通知补发及故障回滚等。
+纯单元/页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`，不需要数据库。`./mvnw clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`；默认 URL 数据库名须以 `_test` 结尾，禁止 URL 内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权在本机应用库验收时，额外设置 `TEST_DB_ALLOW_LOCAL=true`，才允许回环地址上与 `DB_URL` 相同的非系统数据库。每次测试创建随机 `foundation_it_*` / `endpoint_it_*` / `task_it_*` / `push_it_*` schema，只删除本次随机 schema，不清空数据库或修改现有业务 schema。真实协议服务仅监听回环地址，使用临时目录和测试凭据。测试覆盖 V1→V4 增量迁移、JPA、重启保留、测试专用 V5 升级、页面防伪、双协议能力、任务幂等、领取、通知补发及故障回滚等。
 
 首次启动由 Flyway 在应用 schema 建立迁移历史与 `platform_metadata`，通过 `PlatformMetadata` 实体和 `JpaRepository` 读写。Hibernate 使用 `ddl-auto=validate` 校验映射，关闭 Open Session in View；不自动创建或修改表。V1 只保存平台元数据，不预建业务表。后续升级新增 Flyway 迁移，不改写已执行 SQL。JPA 改造兼容已有 V1 表，不需要删表或重新建库。测试专用迁移不进入应用 JAR。失败迁移直接阻止启动，不执行 Flyway clean。
 

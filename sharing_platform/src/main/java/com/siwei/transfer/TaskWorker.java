@@ -42,12 +42,12 @@ public class TaskWorker {
     public void poll() {
         int capacity = executor.getMaximumPoolSize() - executor.getActiveCount();
         if (capacity <= 0) return;
-        List<Map<String, Object>> due = db.queryForList("SELECT id,direction FROM transfer_task WHERE (status='QUEUED' AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes') ORDER BY next_run_at LIMIT ?", capacity);
+        List<Map<String, Object>> due = db.queryForList("SELECT id,direction FROM transfer_task WHERE (status IN ('QUEUED','RECONCILING') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes') ORDER BY next_run_at LIMIT ?", capacity);
         for (Map<String, Object> row : due) {
             String id = (String) row.get("id"), direction = (String) row.get("direction");
             if (!processors.containsKey(direction)) continue;
             String claim = UUID.randomUUID().toString();
-            int updated = db.update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() WHERE id=? AND ((status='QUEUED' AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
+            int updated = db.update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() WHERE id=? AND ((status IN ('QUEUED','RECONCILING') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
             if (updated == 0) continue;
             active.put(id, claim);
             try { executor.execute(() -> run(id, claim, processors.get(direction))); }
@@ -64,14 +64,18 @@ public class TaskWorker {
         try {
             String caller = db.queryForObject("SELECT caller_id FROM transfer_task WHERE id=?", String.class, id);
             task = tasks.get(caller, id);
-            // shortcut: processors must reconcile external effects after a lost result commit; PR4/05 add publication checks.
+            // shortcut: PULL still needs external-effect reconciliation after a lost result commit; add it with PR5.
             result = processor.process(task);
             if (!Set.of("SUCCEEDED", "FAILED", "REJECTED", "WAITING_FEEDBACK", "RECONCILING").contains(result.status))
                 throw new IllegalArgumentException("Invalid processor result");
         } catch (Exception error) {
             try {
                 int attempts = db.queryForObject("SELECT attempts FROM transfer_task WHERE id=?", Integer.class, id);
-                if (error instanceof IOException && attempts < 3) {
+                boolean publishing = db.queryForObject("SELECT push_publish_intent FROM transfer_task WHERE id=?", Boolean.class, id);
+                if (publishing) {
+                    result = new TaskProcessor.Result("RECONCILING", "PUBLISHING", "PUBLICATION_UNKNOWN", null);
+                } else if (error instanceof IOException && !(error instanceof PushProcessor.SourceChanged)
+                        && attempts < (task != null && task.direction.equals("PUSH") ? 4 : 3)) {
                     db.update("UPDATE transfer_task SET status='QUEUED',phase='RETRY_WAIT',error_type='NETWORK_TEMP',error_detail=?,next_run_at=?,claim_id=NULL,claimed_at=NULL,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
                             safe(error), java.sql.Timestamp.from(Instant.now().plusSeconds(5L * attempts)), id, claim);
                     return;
@@ -80,7 +84,7 @@ public class TaskWorker {
                     String caller = db.queryForObject("SELECT caller_id FROM transfer_task WHERE id=?", String.class, id);
                     task = tasks.get(caller, id);
                 }
-                result = new TaskProcessor.Result("FAILED", "COMPLETE",
+                if (result == null) result = new TaskProcessor.Result("FAILED", "COMPLETE",
                         error instanceof IOException ? "NETWORK_TEMP" : "CONFIG", safe(error));
             } catch (Exception persistenceFailure) {
                 log.warn("task retry persistence failed id={} type={}", id, persistenceFailure.getClass().getSimpleName());
@@ -102,8 +106,8 @@ public class TaskWorker {
 
     private void finish(Task task, String claim, TaskProcessor.Result result) {
         tx.executeWithoutResult(status -> {
-            int updated = db.update("UPDATE transfer_task SET status=?,phase=?,error_type=?,error_detail=?,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
-                    result.status, result.phase, result.errorType, result.errorDetail, task.taskRecordId, claim);
+            int updated = db.update("UPDATE transfer_task SET status=?,phase=?,error_type=?,error_detail=?,next_run_at=CASE WHEN ?='RECONCILING' THEN now()+interval '30 seconds' ELSE next_run_at END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
+                    result.status, result.phase, result.errorType, result.errorDetail, result.status, task.taskRecordId, claim);
             if (updated == 0 || result.status.equals("RECONCILING")) return;
             String stage = result.status.equals("WAITING_FEEDBACK") || result.status.equals("REJECTED") ? "PRECHECK" : "COMPLETE";
             String recipient = db.queryForObject("SELECT notification_url FROM transfer_task WHERE id=?", String.class, task.taskRecordId);
@@ -114,6 +118,16 @@ public class TaskWorker {
                 var notice = json.createObjectNode();
                 notice.put("notificationId", notificationId); notice.put("taskRecordId", task.taskRecordId);
                 notice.put("taskId", task.taskId); notice.put("stage", stage); notice.put("result", result.status);
+                if (stage.equals("COMPLETE") && task.direction.equals("PUSH")) {
+                    var products = notice.putArray("products");
+                    for (Map<String, Object> product : task.products) {
+                        var item = products.addObject();
+                        item.put("productId", (String) product.get("product_id"));
+                        item.put("productPath", task.deliveryPath(product));
+                        if (product.get("product_name") != null) item.put("productName", (String) product.get("product_name"));
+                    }
+                    notice.put("fileCount", task.products.size());
+                }
                 if (result.errorType != null) notice.put("errorType", result.errorType);
                 if (result.errorDetail != null) notice.put("errorDetail", result.errorDetail);
                 payload = notice.toString();

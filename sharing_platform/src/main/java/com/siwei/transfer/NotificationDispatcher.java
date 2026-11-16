@@ -64,7 +64,7 @@ public class NotificationDispatcher {
             String acceptedAck = ack;
             tx.executeWithoutResult(status -> {
                 int marked = db.update("UPDATE transfer_notification SET status='ACKED',ack=?,claim_id=NULL,claimed_at=NULL,last_error=NULL WHERE id=? AND claim_id=? AND status='SENDING'", acceptedAck, id, claim);
-                if (marked == 1) db.update("UPDATE transfer_task SET status='QUEUED',phase='PRECHECK_ACKED',next_run_at=now(),version=version+1,updated_at=now() WHERE id=? AND status='WAITING_FEEDBACK' AND EXISTS (SELECT 1 FROM transfer_notification WHERE id=? AND stage='PRECHECK' AND result_status='WAITING_FEEDBACK')", taskId, id);
+                if (marked == 1) db.update("UPDATE transfer_task SET status='QUEUED',phase='PRECHECK_ACKED',attempts=0,next_run_at=now(),version=version+1,updated_at=now() WHERE id=? AND status='WAITING_FEEDBACK' AND EXISTS (SELECT 1 FROM transfer_notification WHERE id=? AND stage='PRECHECK' AND result_status='WAITING_FEEDBACK')", taskId, id);
             });
         } else {
             int attempts = db.queryForObject("SELECT attempts FROM transfer_notification WHERE id=?", Integer.class, id);

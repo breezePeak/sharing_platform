@@ -1,6 +1,6 @@
-# PR-03 任务接口契约
+# 任务接口契约（PR-03/04）
 
-本页是新 JSON 接口的实施契约。推送、拉取的真实处理器由 PR-04/05 接入；当前生产配置没有处理器，新任务返回 `503 {"code":"ENGINE_NOT_READY"}`，数据库不创建任务。测试处理器仅在测试类中装配。
+本页是新 JSON 接口的实施契约。PR-04 已接入 PUSH 处理器；PULL 尚未接入，新 PULL 任务返回 `503 {"code":"ENGINE_NOT_READY"}`，数据库不创建任务。旧 XML 仍为暂定契约，默认关闭。
 
 ## 身份与配置
 
@@ -52,7 +52,11 @@ platform:
 
 ## 查询与文件分页
 
-`GET /api/transfers/tasks/{taskRecordId}` 只返回当前调用方的任务、产品、执行状态、阶段、验收状态和各通知摘要。`GET /api/transfers/tasks/{taskRecordId}/files?page=0&size=50` 限 `size=1..100`。PR-03 尚未冻结文件清单，返回 `manifestFrozen=false`、`totalFilesKnown=false` 和空 `files`；这表示数量未知，不代表业务文件数为零。物理文件明细由 PR-04/05 接入。
+`GET /api/transfers/tasks/{taskRecordId}` 只返回当前调用方的任务、产品、执行状态、阶段、验收状态和各通知摘要。PUSH 清单冻结后另返回 `totalFiles`、`totalBytes`、`uploadedBytes`、`verifiedFiles`、`verifiedBytes`；上传和已验证字节分别统计，字节到 100% 仍须等待发布与通知。`GET /api/transfers/tasks/{taskRecordId}/files?page=0&size=50` 限 `size=1..100`。PUSH 清单冻结前返回 `manifestFrozen=false`、`totalFilesKnown=false` 和空 `files`；冻结后返回 `totalFiles` 及逐文件产品 ID、相对路径、字节数、SHA-256 和验证状态。文件数不等于产品数。
+
+PUSH 的 `fileCount` 可选；提供时必须等于 `products` 数量。每个产品对应受控源根目录下的非空产品目录。默认拒绝零字节文件及 `.tmp`、`.part`、`.crdownload` 后缀，可通过 `platform.transfers.allow-zero-byte-files` 和 `platform.transfers.temporary-suffixes` 调整。PUSH 连接需配置 `writeRoot`、`probeDirectory` 和 `localSourceRef`；预检在探测目录实际写入、回读、改名并清理。预检通过后的 PRECHECK 通知获关联 ACK 前不上传业务文件。
+
+交付位置为 `targetPath/sourceCode/taskRecordId/productId/相对路径`（未提供 `sourceCode` 时使用安全的调用方 ID）。任务根目录的 `_manifest.xml` 记录固定目录和文件大小、SHA-256；最后发布的 `_READY` 为 UTF-8 文本，含 `taskId`、`manifestSha256`、`productCount`。接收方须按匹配的标记与清单消费，外部规则仍需联调。发布结果不明时状态为 `RECONCILING`，不发失败完成单；重入先回读标记和清单，再决定是否续发。已确认成功的 COMPLETE 通知列出全部原产品及相对交付路径；通知补发不重新传输。
 
 ## 通知与 ACK
 

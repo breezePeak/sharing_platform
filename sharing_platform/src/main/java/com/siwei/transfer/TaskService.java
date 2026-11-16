@@ -19,20 +19,23 @@ import org.xml.sax.InputSource;
 
 @Service
 public class TaskService {
-    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products");
+    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products", "fileCount");
     private final ObjectMapper json;
     private final JdbcTemplate db;
     private final TransactionTemplate tx;
     private final TransferSettings settings;
     private final EndpointRepository endpoints;
     private final EndpointRevisionRepository revisions;
+    private final EndpointSettings endpointSettings;
     private final List<TaskProcessor> processors;
 
     public TaskService(ObjectMapper json, JdbcTemplate db, org.springframework.transaction.PlatformTransactionManager transactionManager,
                        TransferSettings settings, EndpointRepository endpoints, EndpointRevisionRepository revisions,
+                       EndpointSettings endpointSettings,
                        List<TaskProcessor> processors) {
         this.json = json; this.db = db; this.tx = new TransactionTemplate(transactionManager);
-        this.settings = settings; this.endpoints = endpoints; this.revisions = revisions; this.processors = processors;
+        this.settings = settings; this.endpoints = endpoints; this.revisions = revisions;
+        this.endpointSettings = endpointSettings; this.processors = processors;
     }
 
     public String authenticate(String authorization) {
@@ -119,6 +122,7 @@ public class TaskService {
         if (!config.getEndpointIds().contains(endpointId)) throw error(HttpStatus.FORBIDDEN, "ENDPOINT_FORBIDDEN");
         String canonical = canonical(input, endpointId);
         if (previous != null) return compare(previous, canonical);
+        if (direction.equals("PUSH") && !settings.isPushIntakeEnabled()) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
         if (processors.stream().noneMatch(p -> p.direction().equals(direction))) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
         if (config.getNotificationUrl() == null || config.getNotificationUrl().isBlank())
             throw error(HttpStatus.SERVICE_UNAVAILABLE, "NOTIFICATION_NOT_CONFIGURED");
@@ -135,8 +139,12 @@ public class TaskService {
             EndpointRevision revision = revisions.findByEndpointIdAndRevision(endpointId, endpoint.revision).orElseThrow();
             try { validateScope(input, direction, revision); }
             catch (IllegalArgumentException e) { throw invalid(); }
-            int count = db.update("INSERT INTO transfer_task (id,caller_id,external_task_id,entry_type,direction,endpoint_id,endpoint_revision_id,notification_url,canonical_request,raw_request,status,phase,next_run_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'QUEUED','ACCEPTED',?,?,?) ON CONFLICT (caller_id,external_task_id) DO NOTHING",
-                    id, caller, taskId, entry, direction, endpointId, revision.id, notificationUrl.toString(), canonical, canonical, now, now, now);
+            String sourceRoot = null;
+            if (direction.equals("PUSH")) try {
+                sourceRoot = ControlledPaths.localDirectory(endpointSettings.getLocalRoots().get(revision.localSourceRef)).toString();
+            } catch (java.io.IOException | IllegalArgumentException e) { throw invalid(); }
+            int count = db.update("INSERT INTO transfer_task (id,caller_id,external_task_id,entry_type,direction,endpoint_id,endpoint_revision_id,notification_url,canonical_request,raw_request,push_source_root,status,phase,next_run_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'QUEUED','ACCEPTED',?,?,?) ON CONFLICT (caller_id,external_task_id) DO NOTHING",
+                    id, caller, taskId, entry, direction, endpointId, revision.id, notificationUrl.toString(), canonical, canonical, sourceRoot, now, now, now);
             if (count == 1 && input.has("products")) {
                 JsonNode products = input.get("products");
                 for (int i = 0; i < products.size(); i++) {
@@ -174,8 +182,10 @@ public class TaskService {
             if (node != null && !node.isNull()) value.put(field, required(input, field, 1000));
         }
         JsonNode products = input.get("products");
+        if (input.has("fileCount") && products == null) throw invalid();
         if (products != null) {
             if (!products.isArray() || products.size() > 1000) throw invalid();
+            if (input.has("fileCount") && (!input.get("fileCount").isIntegralNumber() || input.get("fileCount").asInt(-1) != products.size())) throw invalid();
             ArrayNode normalized = value.putArray("products");
             List<ObjectNode> sorted = new ArrayList<>();
             Set<String> productIds = new HashSet<>();
@@ -220,14 +230,28 @@ public class TaskService {
         if (task == null) throw error(HttpStatus.NOT_FOUND, "TASK_NOT_FOUND");
         task.products = db.queryForList("SELECT position,product_id,product_path,product_name FROM transfer_product WHERE task_id=? ORDER BY position", id);
         task.notifications = db.queryForList("SELECT id,stage,status,attempts,last_error FROM transfer_notification WHERE task_id=? ORDER BY created_at", id);
+        if (db.queryForObject("SELECT push_manifest_sha256 IS NOT NULL FROM transfer_task WHERE id=?", Boolean.class, id)) {
+            Map<String, Object> progress = db.queryForMap("SELECT count(*) AS total_files,coalesce(sum(size_bytes),0) AS total_bytes,coalesce(sum(uploaded_bytes),0) AS uploaded_bytes,count(*) FILTER (WHERE verified) AS verified_files,coalesce(sum(size_bytes) FILTER (WHERE verified),0) AS verified_bytes FROM transfer_file WHERE task_id=?", id);
+            task.totalFiles = ((Number) progress.get("total_files")).longValue();
+            task.totalBytes = ((Number) progress.get("total_bytes")).longValue();
+            task.uploadedBytes = ((Number) progress.get("uploaded_bytes")).longValue();
+            task.verifiedFiles = ((Number) progress.get("verified_files")).longValue();
+            task.verifiedBytes = ((Number) progress.get("verified_bytes")).longValue();
+        }
         return task;
     }
 
     public Map<String, Object> files(String caller, String id, int page, int size) {
-        get(caller, id);
+        Task task = get(caller, id);
         if (page < 0 || size < 1 || size > 100) throw invalid();
-        return Map.of("taskRecordId", id, "page", page, "size", size, "manifestFrozen", false,
+        boolean frozen = task.totalFiles != null;
+        if (!frozen) return Map.of("taskRecordId", id, "page", page, "size", size, "manifestFrozen", false,
                 "totalFilesKnown", false, "files", List.of());
+        long count = db.queryForObject("SELECT count(*) FROM transfer_file WHERE task_id=?", Long.class, id);
+        List<Map<String, Object>> rows = db.queryForList("SELECT product_id,relative_path,size_bytes,sha256,verified FROM transfer_file WHERE task_id=? ORDER BY product_id,relative_path LIMIT ? OFFSET ?",
+                id, size, (long) page * size);
+        return Map.of("taskRecordId", id, "page", page, "size", size, "manifestFrozen", true,
+                "totalFilesKnown", true, "totalFiles", count, "files", rows);
     }
 
     private Task findByExternal(String caller, String id) {
