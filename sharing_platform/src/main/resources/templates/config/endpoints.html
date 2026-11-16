@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>连接配置 · 数据共享平台</title><link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body><header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <p class="eyebrow">平台配置</p><h1>FTP / SFTP 连接</h1>
+  <p><a class="button" th:href="@{/config/endpoints/new}">新增连接</a></p>
+  <p>检测异步执行，刷新页面查看结果。旧版本结果不代表当前配置可用，每次任务仍需预检查。监听与任务业务尚未开放。</p>
+  <section class="empty" th:if="${#lists.isEmpty(rows)}"><h2>暂无连接</h2><p>新增连接后可检测实际读写、回读校验及重命名能力。</p></section>
+  <article class="panel" th:each="row : ${rows}">
+    <h2><a th:href="@{/config/endpoints/{id}(id=${row.id})}" th:text="${row.name}">连接</a></h2>
+    <p><span th:text="${row.protocol}"></span> · <span th:text="${row.host}"></span>:<span th:text="${row.port}"></span>
+      · 版本 <span th:text="${row.revision}"></span> · <strong th:text="${row.enabled ? '已启用' : '已停用'}"></strong></p>
+    <p>连接编号：<code th:text="${row.id}"></code></p>
+    <div class="actions">
+      <form method="post" th:action="@{/config/endpoints/{id}/toggle(id=${row.id})}">
+        <input type="hidden" name="_csrf" th:value="${csrfToken}"><input type="hidden" name="revision" th:value="${row.revision}">
+        <button th:text="${row.enabled ? '停用' : '启用'}"></button>
+      </form>
+      <form method="post" th:action="@{/config/endpoints/{id}/probe(id=${row.id})}">
+        <input type="hidden" name="_csrf" th:value="${csrfToken}"><input type="hidden" name="revision" th:value="${row.revision}">
+        <button th:disabled="${!row.enabled}">检测能力</button>
+      </form>
+    </div>
+    <p th:if="${row.probe == null}">健康：UNKNOWN（尚未检测）。容量：UNKNOWN。</p>
+    <section th:if="${row.probe != null}" aria-label="最近检测">
+      <p th:if="${row.stale}" class="notice">检测已过期：以下属于旧配置版本，请重新检测。</p>
+      <p>检测时间 <span th:text="${row.probe.startedAt}"></span> · 状态 <strong th:text="${row.probe.status}"></strong>
+        · 检测版本编号 <code th:text="${row.probe.revisionId}"></code></p>
+      <p>读取 <span th:text="${row.probe.canRead}"></span> · 写入 <span th:text="${row.probe.canWrite}"></span>
+        · 完整性 <span th:text="${row.probe.verified}"></span> · 重命名 <span th:text="${row.probe.canRename}"></span>
+        · 容量 <span th:text="${row.probe.capacity}"></span></p>
+      <p th:if="${!row.stale}" th:text="${row.probe.strictPush ? '满足本次探测的严格推送条件' : '尚不满足严格推送条件；只读连接可单独用于拉取'}"></p>
+      <details><summary>阶段与原因</summary><pre th:text="${row.probe.details}"></pre></details>
+      <p class="notice" th:if="${!#strings.isEmpty(row.probe.residuals)}">残留或创建结果未知的路径（人工核对归属后处理）：</p>
+      <pre th:if="${!#strings.isEmpty(row.probe.residuals)}" th:text="${row.probe.residuals}"></pre>
+    </section>
+  </article>
+</main></body></html>

@@ -13,4 +13,14 @@ p { line-height: 1.8; }
 .empty { padding: 2rem; border: 1px solid #dbe3eb; border-radius: .75rem; background: white; }
 :focus-visible { outline: 3px solid #ea9700; outline-offset: 3px; }
 code { overflow-wrap: anywhere; }
+.panel { padding: 1.5rem; margin: 1.5rem 0; border: 1px solid #dbe3eb; border-radius: .75rem; background: white; }
+.fields { max-width: 780px; }
+label { display: block; margin: 1rem 0; line-height: 1.6; }
+input, select, button { font: inherit; padding: .6rem; border: 1px solid #879bae; border-radius: .3rem; }
+input:not([type=checkbox]):not([type=hidden]), select { display: block; width: 100%; margin-top: .3rem; }
+button, .button { cursor: pointer; background: #175b96; color: white; padding: .6rem 1rem; border-radius: .3rem; }
+button:disabled { opacity: .5; cursor: default; }
+.actions { display: flex; flex-wrap: wrap; gap: 1rem; }
+.notice { color: #8a3300; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
 @media (max-width: 600px) { header { gap: 1rem; } nav { flex-basis: 100%; } main { margin-top: 2rem; } }

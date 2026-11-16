@@ -21,6 +21,8 @@ spring:
   mvc:
     log-request-details: false
 server:
+  tomcat:
+    max-http-form-post-size: 16KB
   error:
     include-message: never
     include-binding-errors: never
@@ -45,3 +47,7 @@ logging:
   level:
     org.hibernate.SQL: WARN
     org.hibernate.type.descriptor.sql.BasicBinder: WARN
+platform:
+  endpoints:
+    master-key: ${ENDPOINT_MASTER_KEY:}
+    key-directory: ${ENDPOINT_KEY_DIRECTORY:}

@@ -25,13 +25,14 @@ class PageTest {
 
     @Test
     void pagesAreDirectlyAccessibleAndRenderHonestEmptyStates() throws Exception {
-        for (String page : new String[] {"/services", "/config", "/tasks"}) {
+        for (String page : new String[] {"/services", "/tasks"}) {
             mvc.perform(get(page)).andExpect(status().isOk())
                     .andExpect(content().string(containsString("尚未开放")))
                     .andExpect(content().string(containsString("/css/app.css")))
                     .andExpect(content().string(not(containsString("/login"))));
         }
         mvc.perform(get("/")).andExpect(redirectedUrl("/services"));
+        mvc.perform(get("/config")).andExpect(redirectedUrl("/config/endpoints"));
         mvc.perform(get("/login")).andExpect(status().isNotFound());
     }
 

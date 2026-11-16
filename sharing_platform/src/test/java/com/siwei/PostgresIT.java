@@ -85,11 +85,11 @@ class PostgresIT {
         String upgradeSchema = SCHEMA + "_upgrade";
         try {
             Flyway original = Flyway.configure().dataSource(URL, USER, PASSWORD)
-                    .defaultSchema(upgradeSchema).locations("classpath:db/migration").load();
+                    .defaultSchema(upgradeSchema).locations("classpath:db/migration").target("1").load();
             assertThat(original.migrate().migrationsExecuted).isEqualTo(1);
             Flyway upgraded = Flyway.configure().dataSource(URL, USER, PASSWORD).defaultSchema(upgradeSchema)
                     .locations("classpath:db/migration", "classpath:db/upgrade").load();
-            assertThat(upgraded.migrate().migrationsExecuted).isEqualTo(1);
+            assertThat(upgraded.migrate().migrationsExecuted).isEqualTo(2);
             try (var connection = DriverManager.getConnection(URL, USER, PASSWORD);
                  var statement = connection.createStatement()) {
                 try (var result = statement.executeQuery("SELECT value, description FROM " + upgradeSchema
