@@ -107,14 +107,15 @@ final class SftpRemoteFileClient extends ScopedRemoteClient {
             String path = config.writeRoot != null ? config.writeRoot : config.readRoot;
             authorize(path, false, true);
             var stat = sftp.getExtension(org.apache.sshd.sftp.client.extensions.openssh.OpenSSHStatPathExtension.class);
+            // Some virtual filesystems report zero after a successful write probe; treat it as unknown capacity.
             if (stat != null && stat.isSupported()) {
                 var info = stat.stat(path);
-                if (info.f_bavail >= 0 && info.f_frsize > 0) return "BYTES:" + Math.multiplyExact(info.f_bavail, info.f_frsize);
+                if (info.f_bavail > 0 && info.f_frsize > 0) return "BYTES:" + Math.multiplyExact(info.f_bavail, info.f_frsize);
             }
             var space = sftp.getExtension(org.apache.sshd.sftp.client.extensions.SpaceAvailableExtension.class);
             if (space != null && space.isSupported()) {
                 long available = space.available(path).unusedBytesAvailableToUser;
-                if (available >= 0) return "BYTES:" + available;
+                if (available > 0) return "BYTES:" + available;
             }
         } catch (IOException | RuntimeException ignored) { /* an unavailable capacity extension is not evidence of free space */ }
         return "UNKNOWN";
