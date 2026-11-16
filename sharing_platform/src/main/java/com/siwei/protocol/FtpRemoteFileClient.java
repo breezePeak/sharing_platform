@@ -43,6 +43,9 @@ final class FtpRemoteFileClient extends ScopedRemoteClient {
         ftp.setDefaultTimeout(config.timeoutSeconds * 1000);
         ftp.setDataTimeout(Duration.ofSeconds(config.timeoutSeconds));
         ftp.setControlEncoding("UTF-8");
+    }
+
+    void connect(EndpointRevision config, String password) throws IOException {
         try {
             ftp.connect(config.host, config.port);
             ftp.setSoTimeout(config.timeoutSeconds * 1000);

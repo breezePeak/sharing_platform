@@ -11,7 +11,7 @@ import java.util.function.BooleanSupplier;
 
 /** Real loopback FTP wire fixture: control disconnect deliberately does not stop an active data transfer. */
 public final class StreamingFtpServer implements AutoCloseable {
-    public enum Fault { RETR, STOR, LIST, OPENING, ACTIVE_ACCEPT }
+    public enum Fault { RETR, STOR, LIST, OPENING, ACTIVE_ACCEPT, WELCOME, AUTH }
     private final ServerSocket listener = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"));
     private final Set<Closeable> resources = ConcurrentHashMap.newKeySet();
     private final ExecutorService handlers = Executors.newCachedThreadPool(r -> { Thread t = new Thread(r, "ftp-wire-fixture"); t.setDaemon(true); return t; });
@@ -19,7 +19,7 @@ public final class StreamingFtpServer implements AutoCloseable {
     private final Semaphore ticks = new Semaphore(0);
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Fault fault;
-    public final AtomicInteger started = new AtomicInteger(), stopped = new AtomicInteger();
+    public final AtomicInteger started = new AtomicInteger(), stopped = new AtomicInteger(), connections = new AtomicInteger();
     public final AtomicLong bytes = new AtomicLong();
     public final CountDownLatch opening = new CountDownLatch(1), releaseOpening = new CountDownLatch(1);
     public final CompletableFuture<Void> openingDataClosed = new CompletableFuture<>();
@@ -42,17 +42,22 @@ public final class StreamingFtpServer implements AutoCloseable {
     private void serve(Socket control) {
         ServerSocket passive = null;
         InetSocketAddress active = null;
+        boolean slowHandshake = connections.incrementAndGet() <= 2;
         try (Socket connection = control;
              BufferedReader input = new BufferedReader(new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8));
              PrintWriter output = new PrintWriter(new OutputStreamWriter(connection.getOutputStream(), StandardCharsets.UTF_8), true)) {
-            connection.setSoTimeout(15000); reply(output, "220 streaming test fixture");
+            connection.setSoTimeout(15000);
+            if (fault == Fault.WELCOME && slowHandshake) { streamReply(output, "220-"); return; }
+            reply(output, "220 streaming test fixture");
             String line;
             while (!closed.get() && (line = input.readLine()) != null) {
                 String[] parts = line.split(" ", 2);
                 String command = parts[0], path = parts.length == 2 ? parts[1] : "";
                 switch (command) {
                     case "USER": reply(output, "331 password"); break;
-                    case "PASS": reply(output, "230 logged in"); break;
+                    case "PASS":
+                        if (fault == Fault.AUTH && slowHandshake) { streamReply(output, "230-"); return; }
+                        reply(output, "230 logged in"); break;
                     case "TYPE": reply(output, "200 binary"); break;
                     case "SYST": reply(output, "215 UNIX Type: L8"); break;
                     case "MLST":
@@ -105,6 +110,17 @@ public final class StreamingFtpServer implements AutoCloseable {
             resources.remove(control);
             if (passive != null) { try { passive.close(); } catch (IOException ignored) { } resources.remove(passive); }
         }
+    }
+
+    private void streamReply(PrintWriter output, String prefix) throws InterruptedException {
+        started.incrementAndGet();
+        try {
+            while (!closed.get()) {
+                if (!ticks.tryAcquire(1, TimeUnit.SECONDS)) break;
+                reply(output, prefix + " waiting");
+                if (output.checkError()) break;
+            }
+        } finally { stopped.incrementAndGet(); }
     }
 
     private void stream(Socket data, String command) throws IOException, InterruptedException {

@@ -48,7 +48,7 @@ platform:
 
 同一调用方和任务号、相同规范化业务内容返回 HTTP 200，`reused=true`，保留原配置修订和任务号。方向、endpoint、来源代码、路径或产品范围变化返回 409 `TASK_ID_CONFLICT`。产品顺序和 JSON 属性顺序不影响指纹；产品显示名参与比较。XML `type` 对应 JSON `sourceCode`，跨格式重放时需提供相同来源代码。配置编辑后重放原请求仍按原快照比较。受理事务失败返回 500，不返回 `accepted=true`。
 
-错误体为 `{"code":"..."}`。常见状态：400 `INVALID_TASK` / `ENDPOINT_DISABLED`，401 `AUTH_REQUIRED`，403 `ENDPOINT_FORBIDDEN`，404 `TASK_NOT_FOUND`，409 `TASK_ID_CONFLICT`，503 `ENGINE_NOT_READY` / `NOTIFICATION_NOT_CONFIGURED`。
+错误体为 `{"code":"..."}`。常见状态：400 `INVALID_TASK` / `ENDPOINT_DISABLED`，401 `AUTH_REQUIRED`，403 `ENDPOINT_FORBIDDEN`，404 `TASK_NOT_FOUND`，409 `TASK_ID_CONFLICT`，413 `REQUEST_TOO_LARGE`（请求体超过 32 KiB），503 `ENGINE_NOT_READY` / `NOTIFICATION_NOT_CONFIGURED`。
 
 ## 查询与文件分页
 
