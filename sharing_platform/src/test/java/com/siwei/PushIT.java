@@ -99,7 +99,9 @@ class PushIT {
             String endpointId = endpoints.save(null, form);
             String revisionId = revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id;
             Task task = task(endpointId, revisionId);
-            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK");
+            TaskProcessor.Result precheck = push.process(task);
+            assertThat(precheck.status).describedAs("precheck: %s / %s", precheck.errorType, precheck.errorDetail)
+                    .isEqualTo("WAITING_FEEDBACK");
             assertThat(Files.exists(remoteRoot.resolve("deliver/weather/" + task.taskRecordId + "/_READY"))).isFalse();
             task.phase = "PRECHECK_ACKED";
             assertThat(push.process(task).status).isEqualTo("SUCCEEDED");
