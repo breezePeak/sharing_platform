@@ -5,6 +5,7 @@
 .env
 .env.*
 !.env.example
+/sharing_platform/config/application.yml
 *.log
 data/
 *.dump

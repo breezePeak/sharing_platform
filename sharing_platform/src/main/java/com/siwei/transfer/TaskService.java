@@ -17,7 +17,7 @@ import org.xml.sax.InputSource;
 
 @Service
 public class TaskService {
-    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products");
+    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products", "fileCount");
     private final ObjectMapper json;
     private final TransferJpa db;
     private final TransferTaskRepository taskRecords;
@@ -27,16 +27,19 @@ public class TaskService {
     private final TransferSettings settings;
     private final EndpointRepository endpoints;
     private final EndpointRevisionRepository revisions;
+    private final EndpointSettings endpointSettings;
     private final List<TaskProcessor> processors;
 
     public TaskService(ObjectMapper json, TransferJpa db, TransferTaskRepository taskRecords,
                        TransferProductRepository productRecords, TransferNotificationRepository notificationRecords,
                        org.springframework.transaction.PlatformTransactionManager transactionManager,
                        TransferSettings settings, EndpointRepository endpoints, EndpointRevisionRepository revisions,
+                       EndpointSettings endpointSettings,
                        List<TaskProcessor> processors) {
         this.json = json; this.db = db; this.taskRecords = taskRecords; this.productRecords = productRecords;
         this.notificationRecords = notificationRecords; this.tx = new TransactionTemplate(transactionManager);
-        this.settings = settings; this.endpoints = endpoints; this.revisions = revisions; this.processors = processors;
+        this.settings = settings; this.endpoints = endpoints; this.revisions = revisions;
+        this.endpointSettings = endpointSettings; this.processors = processors;
     }
 
     public String authenticate(String authorization) {
@@ -133,6 +136,7 @@ public class TaskService {
         String canonical = canonical(input, endpointId);
         if (previous != null) return compare(previous, canonical);
         if (!config.getEndpointIds().contains(endpointId)) throw error(HttpStatus.FORBIDDEN, "ENDPOINT_FORBIDDEN");
+        if (direction.equals("PUSH") && !settings.isPushIntakeEnabled()) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
         if (processors.stream().noneMatch(p -> p.direction().equals(direction))) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
         if (config.getNotificationUrl() == null || config.getNotificationUrl().isBlank())
             throw error(HttpStatus.SERVICE_UNAVAILABLE, "NOTIFICATION_NOT_CONFIGURED");
@@ -149,8 +153,12 @@ public class TaskService {
             EndpointRevision revision = revisions.findByEndpointIdAndRevision(endpointId, endpoint.revision).orElseThrow();
             try { validateScope(input, direction, revision); }
             catch (IllegalArgumentException e) { throw invalid(); }
+            String sourceRoot = null;
+            if (direction.equals("PUSH")) try {
+                sourceRoot = ControlledPaths.localDirectory(endpointSettings.getLocalRoots().get(revision.localSourceRef)).toString();
+            } catch (java.io.IOException | IllegalArgumentException e) { throw invalid(); }
             int count = db.insertTask(id, caller, taskId, entry, direction, endpointId, revision.id,
-                    notificationUrl.toString(), canonical, raw, now);
+                    notificationUrl.toString(), canonical, raw, sourceRoot, now);
             if (count == 1 && input.has("products")) {
                 JsonNode products = input.get("products");
                 for (int i = 0; i < products.size(); i++) {
@@ -190,8 +198,10 @@ public class TaskService {
             if (node != null && !node.isNull()) value.put(field, required(input, field, 1000));
         }
         JsonNode products = input.get("products");
+        if (input.has("fileCount") && products == null) throw invalid();
         if (products != null) {
             if (!products.isArray() || products.size() > 1000) throw invalid();
+            if (input.has("fileCount") && (!input.get("fileCount").isIntegralNumber() || input.get("fileCount").asInt(-1) != products.size())) throw invalid();
             ArrayNode normalized = value.putArray("products");
             List<ObjectNode> sorted = new ArrayList<>();
             Set<String> productIds = new HashSet<>();
@@ -232,8 +242,9 @@ public class TaskService {
     }
 
     public Task get(String caller, String id) {
-        Task task = taskRecords.findByIdAndCallerId(id, caller).map(this::task).orElse(null);
-        if (task == null) throw error(HttpStatus.NOT_FOUND, "TASK_NOT_FOUND");
+        TransferTaskRecord record = taskRecords.findByIdAndCallerId(id, caller)
+                .orElseThrow(() -> error(HttpStatus.NOT_FOUND, "TASK_NOT_FOUND"));
+        Task task = task(record);
         task.products = new ArrayList<>();
         for (TransferProductRecord product : productRecords.findByTaskIdOrderByPosition(id)) {
             Map<String, Object> row = new LinkedHashMap<>();
@@ -248,14 +259,27 @@ public class TaskService {
             row.put("attempts", notice.attempts); row.put("last_error", notice.lastError);
             task.notifications.add(row);
         }
+        if (record.pushManifestSha256 != null) {
+            Map<String, Object> progress = db.pushProgress(id);
+            task.totalFiles = ((Number) progress.get("total_files")).longValue();
+            task.totalBytes = ((Number) progress.get("total_bytes")).longValue();
+            task.uploadedBytes = ((Number) progress.get("uploaded_bytes")).longValue();
+            task.verifiedFiles = ((Number) progress.get("verified_files")).longValue();
+            task.verifiedBytes = ((Number) progress.get("verified_bytes")).longValue();
+        }
         return task;
     }
 
     public Map<String, Object> files(String caller, String id, int page, int size) {
-        get(caller, id);
+        Task task = get(caller, id);
         if (page < 0 || size < 1 || size > 100) throw invalid();
-        return Map.of("taskRecordId", id, "page", page, "size", size, "manifestFrozen", false,
+        boolean frozen = task.totalFiles != null;
+        if (!frozen) return Map.of("taskRecordId", id, "page", page, "size", size, "manifestFrozen", false,
                 "totalFilesKnown", false, "files", List.of());
+        long count = db.fileCount(id);
+        List<Map<String, Object>> rows = db.filePage(id, size, (long) page * size);
+        return Map.of("taskRecordId", id, "page", page, "size", size, "manifestFrozen", true,
+                "totalFilesKnown", true, "totalFiles", count, "files", rows);
     }
 
     private Task findByExternal(String caller, String id) {

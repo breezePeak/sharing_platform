@@ -23,6 +23,9 @@ abstract class ScopedRemoteClient implements RemoteFileClient {
     protected void temporary(String path) throws IOException {
         String base = config.probeDirectory == null ? null : ControlledPaths.resolve(config.writeRoot, config.probeDirectory);
         String suffix = base != null && path.startsWith(base + "/") ? path.substring(base.length() + 1) : "";
-        if (!suffix.matches("\\.sharing-probe-[a-f0-9]{32}(/(payload|renamed))?")) throw new IOException("NOT_PLATFORM_TEMPORARY");
+        if (!suffix.matches("\\.sharing-probe-[a-f0-9]{32}(/(payload|renamed))?")
+                && !(path.matches(".*/[a-f0-9-]{36}/\\.sharing-(file-[a-f0-9]{64}|manifest-[a-f0-9-]{36})")
+                    && path.startsWith(config.writeRoot.equals("/") ? "/" : config.writeRoot + "/")))
+            throw new IOException("NOT_PLATFORM_TEMPORARY");
     }
 }

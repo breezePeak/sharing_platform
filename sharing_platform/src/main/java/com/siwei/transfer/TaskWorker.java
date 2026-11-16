@@ -76,14 +76,19 @@ public class TaskWorker {
         try {
             String caller = taskRecords.findById(id).orElseThrow().callerId;
             task = tasks.get(caller, id);
-            // shortcut: processors must reconcile external effects after a lost result commit; PR4/05 add publication checks.
+            // shortcut: PULL still needs external-effect reconciliation after a lost result commit; add it with PR5.
             result = processor.process(task);
             if (!Set.of("SUCCEEDED", "FAILED", "REJECTED", "WAITING_FEEDBACK", "RECONCILING").contains(result.status))
                 throw new IllegalArgumentException("Invalid processor result");
         } catch (Exception error) {
             try {
-                int attempts = taskRecords.findById(id).orElseThrow().attempts;
-                if (error instanceof IOException && attempts < 3) {
+                TransferTaskRecord record = taskRecords.findById(id).orElseThrow();
+                int attempts = record.attempts;
+                boolean publishing = record.pushPublishIntent;
+                if (publishing) {
+                    result = new TaskProcessor.Result("RECONCILING", "PUBLISHING", "PUBLICATION_UNKNOWN", null);
+                } else if (error instanceof IOException && !(error instanceof PushProcessor.SourceChanged)
+                        && attempts < (task != null && task.direction.equals("PUSH") ? 4 : 3)) {
                     db.retryTask(id, claim, safe(error), java.sql.Timestamp.from(Instant.now().plusSeconds(5L * attempts)));
                     return;
                 }
@@ -91,7 +96,7 @@ public class TaskWorker {
                     String caller = taskRecords.findById(id).orElseThrow().callerId;
                     task = tasks.get(caller, id);
                 }
-                result = new TaskProcessor.Result("FAILED", "COMPLETE",
+                if (result == null) result = new TaskProcessor.Result("FAILED", "COMPLETE",
                         error instanceof IOException ? "NETWORK_TEMP" : "CONFIG", safe(error));
             } catch (Exception persistenceFailure) {
                 log.warn("task retry persistence failed id={} type={}", id, persistenceFailure.getClass().getSimpleName());
@@ -122,6 +127,16 @@ public class TaskWorker {
                 var notice = json.createObjectNode();
                 notice.put("notificationId", notificationId); notice.put("taskRecordId", task.taskRecordId);
                 notice.put("taskId", task.taskId); notice.put("stage", stage); notice.put("result", result.status);
+                if (stage.equals("COMPLETE") && task.direction.equals("PUSH")) {
+                    var products = notice.putArray("products");
+                    for (Map<String, Object> product : task.products) {
+                        var item = products.addObject();
+                        item.put("productId", (String) product.get("product_id"));
+                        item.put("productPath", task.deliveryPath(product));
+                        if (product.get("product_name") != null) item.put("productName", (String) product.get("product_name"));
+                    }
+                    notice.put("fileCount", task.products.size());
+                }
                 if (result.errorType != null) notice.put("errorType", result.errorType);
                 if (result.errorDetail != null) notice.put("errorDetail", result.errorDetail);
                 payload = notice.toString();

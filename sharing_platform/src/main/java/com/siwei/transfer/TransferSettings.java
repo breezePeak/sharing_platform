@@ -11,6 +11,9 @@ public class TransferSettings {
     private int workers = 2;
     private int notificationAttempts = 5;
     private boolean provisionalXmlEnabled;
+    private boolean pushIntakeEnabled = true;
+    private boolean allowZeroByteFiles;
+    private Set<String> temporarySuffixes = new HashSet<>(Set.of(".tmp", ".part", ".crdownload"));
 
     public Map<String, Caller> getCallers() { return callers; }
     public void setCallers(Map<String, Caller> callers) { this.callers = callers; }
@@ -20,6 +23,12 @@ public class TransferSettings {
     public void setNotificationAttempts(int notificationAttempts) { this.notificationAttempts = notificationAttempts; }
     public boolean isProvisionalXmlEnabled() { return provisionalXmlEnabled; }
     public void setProvisionalXmlEnabled(boolean provisionalXmlEnabled) { this.provisionalXmlEnabled = provisionalXmlEnabled; }
+    public boolean isPushIntakeEnabled() { return pushIntakeEnabled; }
+    public void setPushIntakeEnabled(boolean pushIntakeEnabled) { this.pushIntakeEnabled = pushIntakeEnabled; }
+    public boolean isAllowZeroByteFiles() { return allowZeroByteFiles; }
+    public void setAllowZeroByteFiles(boolean allowZeroByteFiles) { this.allowZeroByteFiles = allowZeroByteFiles; }
+    public Set<String> getTemporarySuffixes() { return temporarySuffixes; }
+    public void setTemporarySuffixes(Set<String> temporarySuffixes) { this.temporarySuffixes = temporarySuffixes; }
 
     public static class Caller {
         private String token;

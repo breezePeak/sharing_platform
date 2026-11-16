@@ -30,7 +30,7 @@ class TaskServiceTest {
         caller.setXmlRoutes(Map.of("weather", "endpoint"));
         settings.setCallers(Map.of("test", caller));
         service = new TaskService(json, db, tasks, products, notifications,
-                mock(PlatformTransactionManager.class), settings, endpoints, revisions, List.of());
+                mock(PlatformTransactionManager.class), settings, endpoints, revisions, new EndpointSettings(), List.of());
     }
 
     @Test void credentialsAreServerSideAndXxeIsRejected() {
@@ -65,6 +65,27 @@ class TaskServiceTest {
                 .isInstanceOf(ResponseStatusException.class);
         assertThatThrownBy(() -> service.accept("test", service.parseJson(unknown), unknown, "JSON"))
                 .isInstanceOf(ResponseStatusException.class);
+        verifyNoInteractions(db);
+    }
+
+    @Test void fileCountMustMatchProductCount() {
+        String request = "{\"taskId\":\"count\",\"direction\":\"PUSH\",\"endpointId\":\"endpoint\",\"sourceRoot\":\"local\",\"targetPath\":\"a\",\"fileCount\":2,\"products\":[{\"productId\":\"p\",\"productPath\":\"p\"}]}";
+        assertThatThrownBy(() -> service.accept("test", service.parseJson(request), request, "JSON"))
+                .isInstanceOf(ResponseStatusException.class).satisfies(e -> assertThat(((ResponseStatusException) e).getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+    }
+
+    @Test void stoppingNewPushIntakeKeepsExistingProcessorOutOfAcceptancePath() {
+        settings.setPushIntakeEnabled(false);
+        TaskProcessor processor = new TaskProcessor() {
+            public String direction() { return "PUSH"; }
+            public Result process(Task task) { return new Result("SUCCEEDED", "COMPLETE", null, null); }
+        };
+        TaskService stopped = new TaskService(json, db, tasks, products, notifications,
+                mock(PlatformTransactionManager.class), settings, endpoints, revisions,
+                new EndpointSettings(), List.of(processor));
+        String request = "{\"taskId\":\"stopped\",\"direction\":\"PUSH\",\"endpointId\":\"endpoint\",\"sourceRoot\":\"local\",\"targetPath\":\"a\",\"products\":[{\"productId\":\"p\",\"productPath\":\"p\"}]}";
+        assertThatThrownBy(() -> stopped.accept("test", stopped.parseJson(request), request, "JSON"))
+                .isInstanceOf(ResponseStatusException.class).satisfies(e -> assertThat(((ResponseStatusException) e).getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
         verifyNoInteractions(db);
     }
 }

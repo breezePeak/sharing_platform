@@ -102,10 +102,14 @@ class TaskCoreIT {
         p.add("platform.transfers.callers.outsider.token", () -> "other-secret");
         p.add("platform.transfers.callers.outsider.endpoint-ids[0]", () -> OUTSIDER_ENDPOINT);
         p.add("platform.transfers.provisional-xml-enabled", () -> true);
+        p.add("platform.transfers.push-enabled", () -> false);
+        p.add("platform.endpoints.local-roots.local", () -> System.getProperty("java.io.tmpdir"));
     }
 
     @TestConfiguration static class ProcessorConfig {
-        @Bean TaskProcessor testProcessor() {
+        @Bean @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
+                name = "platform.transfers.push-enabled", havingValue = "false")
+        TaskProcessor testProcessor() {
             return new TaskProcessor() {
                 public String direction() { return "PUSH"; }
                 public Result process(Task task) {

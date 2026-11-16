@@ -23,7 +23,7 @@ final class LegacyXml {
                     .append("<fileCount>").append(task.products.size()).append("</fileCount><ProductList>");
             for (java.util.Map<String, Object> product : task.products) {
                 xml.append("<product><productId>").append(escape((String) product.get("product_id")))
-                        .append("</productId><productPath>").append(escape((String) product.get("product_path")))
+                        .append("</productId><productPath>").append(escape(task.deliveryPath(product)))
                         .append("</productPath>");
                 if (product.get("product_name") != null)
                     xml.append("<productName>").append(escape((String) product.get("product_name"))).append("</productName>");

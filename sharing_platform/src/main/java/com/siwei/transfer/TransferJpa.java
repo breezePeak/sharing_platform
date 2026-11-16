@@ -31,16 +31,16 @@ public class TransferJpa {
 
     public int insertTask(String id, String caller, String taskId, String entry, String direction,
                           String endpointId, String revisionId, String notificationUrl, String canonical,
-                          String raw, java.sql.Timestamp now) {
-        return update("INSERT INTO transfer_task (id,caller_id,external_task_id,entry_type,direction,endpoint_id,endpoint_revision_id,notification_url,canonical_request,raw_request,status,phase,next_run_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'QUEUED','ACCEPTED',?,?,?) ON CONFLICT (caller_id,external_task_id) DO NOTHING",
-                id, caller, taskId, entry, direction, endpointId, revisionId, notificationUrl, canonical, raw, now, now, now);
+                          String raw, String sourceRoot, java.sql.Timestamp now) {
+        return update("INSERT INTO transfer_task (id,caller_id,external_task_id,entry_type,direction,endpoint_id,endpoint_revision_id,notification_url,canonical_request,raw_request,push_source_root,status,phase,next_run_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'QUEUED','ACCEPTED',?,?,?) ON CONFLICT (caller_id,external_task_id) DO NOTHING",
+                id, caller, taskId, entry, direction, endpointId, revisionId, notificationUrl, canonical, raw, sourceRoot, now, now, now);
     }
 
     public List<Map<String, Object>> dueTasks(int limit) {
-        return queryForList("SELECT id,direction FROM transfer_task WHERE (status='QUEUED' AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes') ORDER BY next_run_at LIMIT ?", limit);
+        return queryForList("SELECT id,direction FROM transfer_task WHERE (status IN ('QUEUED','RECONCILING') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes') ORDER BY next_run_at LIMIT ?", limit);
     }
     public int claimTask(String id, String claim) {
-        return update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() WHERE id=? AND ((status='QUEUED' AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
+        return update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() WHERE id=? AND ((status IN ('QUEUED','RECONCILING') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
     }
     public int releaseTaskClaim(String id, String claim) {
         return update("UPDATE transfer_task SET status='QUEUED',claim_id=NULL,claimed_at=NULL,attempts=attempts-1,next_run_at=now(),updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'", id, claim);
@@ -53,8 +53,8 @@ public class TransferJpa {
         return update("UPDATE transfer_task SET claimed_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'", id, claim);
     }
     public int finishTask(String id, String claim, TaskProcessor.Result result) {
-        return update("UPDATE transfer_task SET status=?,phase=?,error_type=?,error_detail=?,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
-                result.status, result.phase, result.errorType, result.errorDetail, id, claim);
+        return update("UPDATE transfer_task SET status=?,phase=?,error_type=?,error_detail=?,next_run_at=CASE WHEN ?='RECONCILING' THEN now()+interval '30 seconds' ELSE next_run_at END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
+                result.status, result.phase, result.errorType, result.errorDetail, result.status, id, claim);
     }
     public int insertNotification(String id, String taskId, String stage, String result, String protocol,
                                   String recipient, String payload, String hash) {
@@ -71,10 +71,19 @@ public class TransferJpa {
         return update("UPDATE transfer_notification SET status='ACKED',ack=?,claim_id=NULL,claimed_at=NULL,last_error=NULL WHERE id=? AND claim_id=? AND status='SENDING'", ack, id, claim);
     }
     public int resumeAfterPrecheck(String taskId, String notificationId) {
-        return update("UPDATE transfer_task SET status='QUEUED',phase='PRECHECK_ACKED',next_run_at=now(),version=version+1,updated_at=now() WHERE id=? AND status='WAITING_FEEDBACK' AND EXISTS (SELECT 1 FROM transfer_notification WHERE id=? AND stage='PRECHECK' AND result_status='WAITING_FEEDBACK')", taskId, notificationId);
+        return update("UPDATE transfer_task SET status='QUEUED',phase='PRECHECK_ACKED',attempts=0,next_run_at=now(),version=version+1,updated_at=now() WHERE id=? AND status='WAITING_FEEDBACK' AND EXISTS (SELECT 1 FROM transfer_notification WHERE id=? AND stage='PRECHECK' AND result_status='WAITING_FEEDBACK')", taskId, notificationId);
     }
     public int retryNotification(String id, String claim, String status, java.sql.Timestamp next, String error) {
         return update("UPDATE transfer_notification SET status=?,next_attempt_at=?,last_error=?,claim_id=NULL,claimed_at=NULL WHERE id=? AND claim_id=? AND status='SENDING'",
                 status, next, error, id, claim);
+    }
+    public Map<String, Object> pushProgress(String taskId) {
+        return queryForList("SELECT count(*) AS total_files,coalesce(sum(size_bytes),0) AS total_bytes,coalesce(sum(uploaded_bytes),0) AS uploaded_bytes,count(*) FILTER (WHERE verified) AS verified_files,coalesce(sum(size_bytes) FILTER (WHERE verified),0) AS verified_bytes FROM transfer_file WHERE task_id=?", taskId).get(0);
+    }
+    public long fileCount(String taskId) {
+        return ((Number) bind(entityManager.createNativeQuery("SELECT count(*) FROM transfer_file WHERE task_id=?"), new Object[] {taskId}).getSingleResult()).longValue();
+    }
+    public List<Map<String, Object>> filePage(String taskId, int size, long offset) {
+        return queryForList("SELECT product_id,relative_path,size_bytes,sha256,verified FROM transfer_file WHERE task_id=? ORDER BY product_id,relative_path LIMIT ? OFFSET ?", taskId, size, offset);
     }
 }

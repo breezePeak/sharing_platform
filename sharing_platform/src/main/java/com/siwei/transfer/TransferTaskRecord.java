@@ -16,6 +16,10 @@ public class TransferTaskRecord {
     @Column(name = "notification_url") public String notificationUrl;
     @Column(name = "canonical_request") public String canonicalRequest;
     @Column(name = "raw_request") public String rawRequest;
+    @Column(name = "push_manifest_sha256") public String pushManifestSha256;
+    @Column(name = "push_source_root") public String pushSourceRoot;
+    @Column(name = "push_target_root") public String pushTargetRoot;
+    @Column(name = "push_publish_intent") public boolean pushPublishIntent;
     public String status, phase;
     @Column(name = "acceptance_status") public String acceptanceStatus;
     @Column(name = "error_type") public String errorType;
