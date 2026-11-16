@@ -1,60 +1,86 @@
 package com.siwei.transfer;
 
 import com.fasterxml.jackson.databind.*;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.net.URI;
 import java.net.http.*;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
-import org.springframework.jdbc.core.JdbcTemplate;
+import java.util.concurrent.*;
+import javax.annotation.PreDestroy;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Component
 public class NotificationDispatcher {
-    private final JdbcTemplate db;
+    private static final Logger log = LoggerFactory.getLogger(NotificationDispatcher.class);
+    private final TransferJpa db;
+    private final TransferNotificationRepository notificationRecords;
     private final ObjectMapper json;
     private final int maxAttempts;
     private final TransactionTemplate tx;
     private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5))
             .followRedirects(HttpClient.Redirect.NEVER).build();
+    private final ExecutorService readers = Executors.newCachedThreadPool(r -> {
+        Thread thread = new Thread(r, "notification-ack"); thread.setDaemon(true); return thread;
+    });
 
-    public NotificationDispatcher(JdbcTemplate db, ObjectMapper json, TransferSettings settings,
+    public NotificationDispatcher(TransferJpa db, TransferNotificationRepository notificationRecords,
+                                  ObjectMapper json, TransferSettings settings,
                                   org.springframework.transaction.PlatformTransactionManager manager) {
-        this.db = db; this.json = json;
+        this.db = db; this.notificationRecords = notificationRecords; this.json = json;
         this.tx = new TransactionTemplate(manager);
         this.maxAttempts = Math.max(1, Math.min(20, settings.getNotificationAttempts()));
     }
 
     @Scheduled(fixedDelay = 1000)
     public void poll() {
-        List<Map<String, Object>> due = db.queryForList("SELECT id,task_id,protocol,recipient_url,payload FROM transfer_notification WHERE (status IN ('PENDING','RETRY_WAIT') AND next_attempt_at<=now()) OR (status='SENDING' AND claimed_at<now()-interval '1 minute') ORDER BY next_attempt_at LIMIT 10");
+        List<Map<String, Object>> due = db.dueNotifications();
         for (Map<String, Object> row : due) send(row);
     }
 
     private void send(Map<String, Object> row) {
         String id = (String) row.get("id"), taskId = (String) row.get("task_id");
         String claim = UUID.randomUUID().toString();
-        int updated = db.update("UPDATE transfer_notification SET status='SENDING',claim_id=?,claimed_at=now(),attempts=attempts+1 WHERE id=? AND ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at<=now()) OR (status='SENDING' AND claimed_at<now()-interval '1 minute'))", claim, id);
+        int updated = db.claimNotification(id, claim);
         if (updated == 0) return;
         String error = null, ack = null;
         try {
             HttpRequest request = HttpRequest.newBuilder(URI.create((String) row.get("recipient_url")))
                     .timeout(Duration.ofSeconds(10)).header("Content-Type", row.get("protocol").equals("XML") ? "application/xml" : "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString((String) row.get("payload"))).build();
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IllegalStateException("HTTP " + response.statusCode());
-            if (response.body().length() > 4096) throw new IllegalStateException("ACK_TOO_LARGE");
-            if (row.get("protocol").equals("XML")) {
-                if (!LegacyXml.ack(response.body(), id, taskId)) throw new IllegalStateException("ACK_MISMATCH");
-            } else {
-                JsonNode body = json.readTree(response.body());
-                if (!body.path("accepted").isBoolean() || !body.path("accepted").asBoolean()
-                        || !id.equals(body.path("notificationId").asText())
-                        || !taskId.equals(body.path("taskRecordId").asText())) throw new IllegalStateException("ACK_MISMATCH");
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            CompletableFuture<HttpResponse<InputStream>> pending = client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+            HttpResponse<InputStream> response;
+            try { response = pending.get(remaining(deadline), TimeUnit.NANOSECONDS); }
+            catch (Exception e) { pending.cancel(true); throw e; }
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                response.body().close();
+                throw new IllegalStateException("HTTP " + response.statusCode());
             }
-            ack = response.body();
+            String body;
+            try (InputStream stream = response.body()) {
+                Future<byte[]> reading = readers.submit(() -> stream.readNBytes(4097));
+                try {
+                    byte[] bytes = reading.get(remaining(deadline), TimeUnit.NANOSECONDS);
+                    if (bytes.length > 4096) throw new IllegalStateException("ACK_TOO_LARGE");
+                    body = new String(bytes, StandardCharsets.UTF_8);
+                } catch (Exception e) { reading.cancel(true); pending.cancel(true); throw e; }
+            }
+            if (row.get("protocol").equals("XML")) {
+                if (!LegacyXml.ack(body, id, taskId)) throw new IllegalStateException("ACK_MISMATCH");
+            } else {
+                JsonNode parsed = json.readTree(body);
+                if (!parsed.path("accepted").isBoolean() || !parsed.path("accepted").asBoolean()
+                        || !id.equals(parsed.path("notificationId").asText())
+                        || !taskId.equals(parsed.path("taskRecordId").asText())) throw new IllegalStateException("ACK_MISMATCH");
+            }
+            ack = body;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt(); error = "INTERRUPTED";
         } catch (Exception e) {
@@ -62,16 +88,25 @@ public class NotificationDispatcher {
         }
         if (ack != null) {
             String acceptedAck = ack;
-            tx.executeWithoutResult(status -> {
-                int marked = db.update("UPDATE transfer_notification SET status='ACKED',ack=?,claim_id=NULL,claimed_at=NULL,last_error=NULL WHERE id=? AND claim_id=? AND status='SENDING'", acceptedAck, id, claim);
-                if (marked == 1) db.update("UPDATE transfer_task SET status='QUEUED',phase='PRECHECK_ACKED',next_run_at=now(),version=version+1,updated_at=now() WHERE id=? AND status='WAITING_FEEDBACK' AND EXISTS (SELECT 1 FROM transfer_notification WHERE id=? AND stage='PRECHECK' AND result_status='WAITING_FEEDBACK')", taskId, id);
-            });
+            try {
+                tx.executeWithoutResult(status -> {
+                    int marked = db.ackNotification(id, claim, acceptedAck);
+                    if (marked == 1) db.resumeAfterPrecheck(taskId, id);
+                });
+            } catch (RuntimeException persistenceFailure) {
+                log.warn("notification ACK persistence failed id={} type={}", id, persistenceFailure.getClass().getSimpleName());
+            }
         } else {
-            int attempts = db.queryForObject("SELECT attempts FROM transfer_notification WHERE id=?", Integer.class, id);
+            int attempts = notificationRecords.findById(id).orElseThrow().attempts;
             String nextStatus = attempts >= maxAttempts ? "NEEDS_ATTENTION" : "RETRY_WAIT";
             long delay = Math.min(300, 1L << Math.min(8, attempts));
-            db.update("UPDATE transfer_notification SET status=?,next_attempt_at=?,last_error=?,claim_id=NULL,claimed_at=NULL WHERE id=? AND claim_id=? AND status='SENDING'",
-                    nextStatus, java.sql.Timestamp.from(Instant.now().plusSeconds(delay)), error, id, claim);
+            db.retryNotification(id, claim, nextStatus, java.sql.Timestamp.from(Instant.now().plusSeconds(delay)), error);
         }
     }
+    private static long remaining(long deadline) throws TimeoutException {
+        long nanos = deadline - System.nanoTime();
+        if (nanos <= 0) throw new TimeoutException("ACK_DEADLINE");
+        return nanos;
+    }
+    @PreDestroy public void close() { readers.shutdownNow(); }
 }

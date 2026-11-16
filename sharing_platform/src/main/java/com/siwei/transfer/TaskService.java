@@ -8,9 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
-import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.http.HttpStatus;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
@@ -21,17 +19,23 @@ import org.xml.sax.InputSource;
 public class TaskService {
     private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products");
     private final ObjectMapper json;
-    private final JdbcTemplate db;
+    private final TransferJpa db;
+    private final TransferTaskRepository taskRecords;
+    private final TransferProductRepository productRecords;
+    private final TransferNotificationRepository notificationRecords;
     private final TransactionTemplate tx;
     private final TransferSettings settings;
     private final EndpointRepository endpoints;
     private final EndpointRevisionRepository revisions;
     private final List<TaskProcessor> processors;
 
-    public TaskService(ObjectMapper json, JdbcTemplate db, org.springframework.transaction.PlatformTransactionManager transactionManager,
+    public TaskService(ObjectMapper json, TransferJpa db, TransferTaskRepository taskRecords,
+                       TransferProductRepository productRecords, TransferNotificationRepository notificationRecords,
+                       org.springframework.transaction.PlatformTransactionManager transactionManager,
                        TransferSettings settings, EndpointRepository endpoints, EndpointRevisionRepository revisions,
                        List<TaskProcessor> processors) {
-        this.json = json; this.db = db; this.tx = new TransactionTemplate(transactionManager);
+        this.json = json; this.db = db; this.taskRecords = taskRecords; this.productRecords = productRecords;
+        this.notificationRecords = notificationRecords; this.tx = new TransactionTemplate(transactionManager);
         this.settings = settings; this.endpoints = endpoints; this.revisions = revisions; this.processors = processors;
     }
 
@@ -59,6 +63,7 @@ public class TaskService {
         limit(raw);
         try {
             Element root = LegacyXml.parse(raw);
+            if (xmlTooComplex(root, 1, new int[] {0})) throw invalid();
             if (!root.getTagName().equals("taskNotice")) throw invalid();
             onlyChildren(root, Set.of("taskId", "type", "sourceRoot", "targetPath", "fileCount", "ProductList"));
             ObjectNode node = json.createObjectNode();
@@ -74,7 +79,9 @@ public class TaskService {
                 if (!product.getTagName().equals("product")) throw invalid();
                 onlyChildren(product, Set.of("productId", "productPath", "productName"));
                 ObjectNode item = products.addObject();
-                item.put("productId", child(product, "productId"));
+                String productId = child(product, "productId");
+                if (productId.length() != 32) throw invalid();
+                item.put("productId", productId);
                 item.put("productPath", child(product, "productPath"));
                 String name = child(product, "productName");
                 if (!name.isBlank()) item.put("productName", name);
@@ -83,6 +90,13 @@ public class TaskService {
             return node;
         } catch (ResponseStatusException e) { throw e; }
         catch (Exception e) { throw invalid(); }
+    }
+
+    private static boolean xmlTooComplex(Node node, int depth, int[] count) {
+        if (depth > 16 || ++count[0] > 4096) return true;
+        for (Node child = node.getFirstChild(); child != null; child = child.getNextSibling())
+            if (xmlTooComplex(child, depth + 1, count)) return true;
+        return false;
     }
 
     private static String child(Element parent, String name) {
@@ -116,9 +130,9 @@ public class TaskService {
                 ? previous == null ? config.getXmlRoutes().get(required(input, "type", 100)) : previous.endpointId
                 : required(input, "endpointId", 36);
         if (endpointId == null) throw error(HttpStatus.BAD_REQUEST, "ROUTE_NOT_CONFIGURED");
-        if (!config.getEndpointIds().contains(endpointId)) throw error(HttpStatus.FORBIDDEN, "ENDPOINT_FORBIDDEN");
         String canonical = canonical(input, endpointId);
         if (previous != null) return compare(previous, canonical);
+        if (!config.getEndpointIds().contains(endpointId)) throw error(HttpStatus.FORBIDDEN, "ENDPOINT_FORBIDDEN");
         if (processors.stream().noneMatch(p -> p.direction().equals(direction))) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
         if (config.getNotificationUrl() == null || config.getNotificationUrl().isBlank())
             throw error(HttpStatus.SERVICE_UNAVAILABLE, "NOTIFICATION_NOT_CONFIGURED");
@@ -135,15 +149,17 @@ public class TaskService {
             EndpointRevision revision = revisions.findByEndpointIdAndRevision(endpointId, endpoint.revision).orElseThrow();
             try { validateScope(input, direction, revision); }
             catch (IllegalArgumentException e) { throw invalid(); }
-            int count = db.update("INSERT INTO transfer_task (id,caller_id,external_task_id,entry_type,direction,endpoint_id,endpoint_revision_id,notification_url,canonical_request,raw_request,status,phase,next_run_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'QUEUED','ACCEPTED',?,?,?) ON CONFLICT (caller_id,external_task_id) DO NOTHING",
-                    id, caller, taskId, entry, direction, endpointId, revision.id, notificationUrl.toString(), canonical, canonical, now, now, now);
+            int count = db.insertTask(id, caller, taskId, entry, direction, endpointId, revision.id,
+                    notificationUrl.toString(), canonical, raw, now);
             if (count == 1 && input.has("products")) {
                 JsonNode products = input.get("products");
                 for (int i = 0; i < products.size(); i++) {
                     JsonNode product = products.get(i);
-                    db.update("INSERT INTO transfer_product (task_id,position,product_id,product_path,product_name) VALUES (?,?,?,?,?)",
-                            id, i, product.get("productId").asText(), product.get("productPath").asText(),
-                            product.has("productName") ? product.get("productName").asText() : null);
+                    TransferProductRecord record = new TransferProductRecord();
+                    record.taskId = id; record.position = i; record.productId = product.get("productId").asText();
+                    record.productPath = product.get("productPath").asText();
+                    record.productName = product.has("productName") ? product.get("productName").asText() : null;
+                    productRecords.save(record);
                 }
             }
             return count;
@@ -216,10 +232,22 @@ public class TaskService {
     }
 
     public Task get(String caller, String id) {
-        Task task = read("SELECT * FROM transfer_task WHERE id=? AND caller_id=?", id, caller);
+        Task task = taskRecords.findByIdAndCallerId(id, caller).map(this::task).orElse(null);
         if (task == null) throw error(HttpStatus.NOT_FOUND, "TASK_NOT_FOUND");
-        task.products = db.queryForList("SELECT position,product_id,product_path,product_name FROM transfer_product WHERE task_id=? ORDER BY position", id);
-        task.notifications = db.queryForList("SELECT id,stage,status,attempts,last_error FROM transfer_notification WHERE task_id=? ORDER BY created_at", id);
+        task.products = new ArrayList<>();
+        for (TransferProductRecord product : productRecords.findByTaskIdOrderByPosition(id)) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("position", product.position); row.put("product_id", product.productId);
+            row.put("product_path", product.productPath); row.put("product_name", product.productName);
+            task.products.add(row);
+        }
+        task.notifications = new ArrayList<>();
+        for (TransferNotificationRecord notice : notificationRecords.findByTaskIdOrderByCreatedAt(id)) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", notice.id); row.put("stage", notice.stage); row.put("status", notice.status);
+            row.put("attempts", notice.attempts); row.put("last_error", notice.lastError);
+            task.notifications.add(row);
+        }
         return task;
     }
 
@@ -231,19 +259,16 @@ public class TaskService {
     }
 
     private Task findByExternal(String caller, String id) {
-        return read("SELECT * FROM transfer_task WHERE caller_id=? AND external_task_id=?", caller, id);
+        return taskRecords.findByCallerIdAndExternalTaskId(caller, id).map(this::task).orElse(null);
     }
-    private Task read(String sql, Object... args) {
-        try { return db.queryForObject(sql, (rs, row) -> {
-            Task t = new Task(); t.taskRecordId = rs.getString("id"); t.callerId = rs.getString("caller_id");
-            t.taskId = rs.getString("external_task_id"); t.entryType = rs.getString("entry_type");
-            t.direction = rs.getString("direction"); t.endpointId = rs.getString("endpoint_id");
-            t.endpointRevisionId = rs.getString("endpoint_revision_id"); t.canonicalRequest = rs.getString("canonical_request");
-            t.executionStatus = rs.getString("status"); t.phase = rs.getString("phase");
-            t.acceptanceStatus = rs.getString("acceptance_status"); t.errorType = rs.getString("error_type");
-            t.errorDetail = rs.getString("error_detail"); t.createdAt = rs.getTimestamp("created_at").toInstant();
-            t.updatedAt = rs.getTimestamp("updated_at").toInstant(); return t;
-        }, args); } catch (EmptyResultDataAccessException e) { return null; }
+    private Task task(TransferTaskRecord row) {
+        Task t = new Task(); t.taskRecordId = row.id; t.callerId = row.callerId;
+        t.taskId = row.externalTaskId; t.entryType = row.entryType; t.direction = row.direction;
+        t.endpointId = row.endpointId; t.endpointRevisionId = row.endpointRevisionId;
+        t.canonicalRequest = row.canonicalRequest; t.executionStatus = row.status; t.phase = row.phase;
+        t.acceptanceStatus = row.acceptanceStatus; t.errorType = row.errorType;
+        t.errorDetail = row.errorDetail; t.createdAt = row.createdAt; t.updatedAt = row.updatedAt;
+        return t;
     }
 
     static String required(JsonNode node, String field, int max) {

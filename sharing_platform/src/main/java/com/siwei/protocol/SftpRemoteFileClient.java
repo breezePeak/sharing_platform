@@ -22,19 +22,22 @@ final class SftpRemoteFileClient extends ScopedRemoteClient {
 
     SftpRemoteFileClient(EndpointRevision config, String password, Path key) throws IOException {
         super(config);
-        AtomicBoolean rejectedHost = new AtomicBoolean();
         // Never inherit ~/.ssh identities, host overrides, proxies, or trust-on-first-use.
         ssh.setHostConfigEntryResolver(HostConfigEntryResolver.EMPTY);
         ssh.setKeyIdentityProvider(KeyIdentityProvider.EMPTY_KEYS_PROVIDER);
+        CoreModuleProperties.IDLE_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
+        CoreModuleProperties.AUTH_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
+        org.apache.sshd.sftp.SftpModuleProperties.SFTP_CHANNEL_OPEN_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
+        org.apache.sshd.sftp.client.impl.AbstractSftpClient.SFTP_CLIENT_CMD_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
+    }
+
+    void connect(EndpointRevision config, String password, Path key) throws IOException {
+        AtomicBoolean rejectedHost = new AtomicBoolean();
         ssh.setServerKeyVerifier((client, address, publicKey) -> {
             boolean trusted = config.fingerprint != null && config.fingerprint.equals(KeyUtils.getFingerPrint(publicKey));
             rejectedHost.set(!trusted);
             return trusted;
         });
-        CoreModuleProperties.IDLE_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
-        CoreModuleProperties.AUTH_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
-        org.apache.sshd.sftp.SftpModuleProperties.SFTP_CHANNEL_OPEN_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
-        org.apache.sshd.sftp.client.impl.AbstractSftpClient.SFTP_CLIENT_CMD_TIMEOUT.set(ssh, Duration.ofSeconds(config.timeoutSeconds));
         try {
             ssh.start();
             session = ssh.connect(config.username, config.host, config.port).verify(config.timeoutSeconds * 1000L).getSession();

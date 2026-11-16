@@ -9,14 +9,14 @@
   <taskId>job-001</taskId><type>weather</type>
   <sourceRoot>configured-local-source-ref</sourceRoot><targetPath>batch/001</targetPath>
   <fileCount>1</fileCount>
-  <ProductList><product><productId>product-1</productId><productPath>products/product-1</productPath><productName>示例产品</productName></product></ProductList>
+  <ProductList><product><productId>12345678901234567890123456789012</productId><productPath>products/product-1</productPath><productName>示例产品</productName></product></ProductList>
 </taskNotice>
 ```
 
-`product` 是产品包，`fileCount` 必须等于产品节点数，不能当作物理文件数。`doAsk` 的 `result=0/1` 分别表示预检查通过/拒绝，拒绝字段保留原拼写 `rejectrason`。`doComplete` 的 `status=0/1/2` 分别是成功/失败/作废删除；当前处理器仅产生 0 或 1。完成单保留原产品全集，且只输出一份 `ProductList`。暂定 ACK：
+`product` 是产品包，旧 XML 的 `productId` 必须恰好 32 个字符，`fileCount` 必须等于产品节点数，不能当作物理文件数。`doAsk` 的 `result=0/1` 分别表示预检查通过/拒绝，拒绝字段保留原拼写 `rejectrason`。`doComplete` 的 `status=0/1/2` 分别是成功/失败/作废删除；当前处理器仅产生 0 或 1。完成单保留原产品全集，且只输出一份 `ProductList`。暂定 ACK：
 
 ```xml
 <ack><accepted>true</accepted><notificationId>原通知编号</notificationId><taskRecordId>原内部任务号</taskRecordId></ack>
 ```
 
-禁用 DTD、外部实体、XInclude，并限制报文 32 KiB。XML 与 JSON 等价请求走相同业务规范化逻辑；同 callerId、taskId 且语义不同则 409。
+禁用 DTD、外部实体、XInclude；HTTP 读取限制 32 KiB，解析后最多 4096 个节点、16 层深度。XML 与 JSON 等价请求走相同业务规范化逻辑；同 callerId、taskId 且语义不同则 409。

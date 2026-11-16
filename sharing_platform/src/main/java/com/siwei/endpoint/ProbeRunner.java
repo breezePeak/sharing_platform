@@ -6,6 +6,7 @@ import java.security.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.annotation.PreDestroy;
 import com.siwei.protocol.*;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -35,14 +36,18 @@ public class ProbeRunner {
         EndpointProbe p = store.create(endpointId, revision);
         EndpointRevision r = revisions.findById(p.revisionId).orElseThrow();
         AtomicReference<RemoteFileClient> active = new AtomicReference<>();
+        AtomicBoolean cancelled = new AtomicBoolean();
         try {
             workers.execute(() -> {
                 ScheduledFuture<?> deadline = timer.schedule(() -> {
-                    store.stop(p.id, "TIMED_OUT");
-                    RemoteFileClient client = active.get();
-                    if (client != null) try { client.close(); } catch (IOException ignored) { /* residuals are persisted before writes */ }
+                    try { store.stop(p.id, "TIMED_OUT"); }
+                    finally {
+                        cancelled.set(true);
+                        RemoteFileClient client = active.get();
+                        if (client != null) try { client.close(); } catch (IOException ignored) { /* residuals are persisted before writes */ }
+                    }
                 }, r.timeoutSeconds * 6L, TimeUnit.SECONDS);
-                try { run(p, r, active); }
+                try { run(p, r, active, cancelled); }
                 finally { deadline.cancel(false); }
             });
         } catch (RejectedExecutionException e) {
@@ -52,9 +57,12 @@ public class ProbeRunner {
         return p.id;
     }
 
-    private void run(EndpointProbe p, EndpointRevision r, AtomicReference<RemoteFileClient> active) {
-        try (RemoteFileClient client = factory.connect(r)) {
-            active.set(client);
+    private void run(EndpointProbe p, EndpointRevision r, AtomicReference<RemoteFileClient> active, AtomicBoolean cancelled) {
+        try (RemoteFileClient client = factory.connect(r, created -> {
+            active.set(created);
+            if (cancelled.get()) try { created.close(); } catch (IOException ignored) { }
+        })) {
+            if (cancelled.get()) throw new Stopped();
             new Execution(p, r, client).probe();
             p.status = "COMPLETED";
         } catch (Stopped e) { return;
