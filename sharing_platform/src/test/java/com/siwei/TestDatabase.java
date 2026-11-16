@@ -17,12 +17,16 @@ final class TestDatabase {
         } catch (IllegalArgumentException exception) {
             throw new IllegalArgumentException("TEST_DB_URL is invalid");
         }
+        boolean localOptIn = "true".equals(environment.get("TEST_DB_ALLOW_LOCAL"));
+        boolean localHost = "localhost".equalsIgnoreCase(target.getHost()) || "127.0.0.1".equals(target.getHost());
         if (target.getHost() == null || target.getUserInfo() != null || target.getQuery() != null
                 || target.getFragment() != null || target.getPath() == null
-                || !target.getPath().matches("/[a-zA-Z0-9_]+_test")) {
-            throw new IllegalArgumentException("TEST_DB_URL must name a database ending in _test, without credentials or options");
+                || !(target.getPath().matches("/[a-zA-Z0-9_]+_test")
+                    || (localOptIn && localHost && target.getPath().matches("/[a-zA-Z0-9_]+")
+                        && !target.getPath().equals("/postgres")))) {
+            throw new IllegalArgumentException("TEST_DB_URL must name an isolated _test database or an explicitly opted-in local database, without credentials or options");
         }
-        if (url.equals(environment.get("DB_URL"))) {
+        if (url.equals(environment.get("DB_URL")) && !(localOptIn && localHost)) {
             throw new IllegalArgumentException("The test database must differ from DB_URL");
         }
         return url;

@@ -20,6 +20,10 @@ spring:
     cache: true
   mvc:
     log-request-details: false
+  task:
+    scheduling:
+      pool:
+        size: 2
 server:
   tomcat:
     max-http-form-post-size: 16KB

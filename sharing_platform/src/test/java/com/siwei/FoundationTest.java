@@ -24,6 +24,15 @@ class FoundationTest {
         assertThat(TestDatabase.requireUrl(environment)).endsWith("/isolated_test");
         environment.put("DB_URL", environment.get("TEST_DB_URL"));
         assertThatThrownBy(() -> TestDatabase.requireUrl(environment)).isInstanceOf(IllegalArgumentException.class);
+        environment.put("TEST_DB_ALLOW_LOCAL", "true");
+        environment.put("TEST_DB_URL", "jdbc:postgresql://127.0.0.1:5432/sharing_platform");
+        environment.put("DB_URL", environment.get("TEST_DB_URL"));
+        assertThat(TestDatabase.requireUrl(environment)).isEqualTo(environment.get("DB_URL"));
+        environment.put("TEST_DB_URL", "jdbc:postgresql://remote.example/sharing_platform");
+        assertThatThrownBy(() -> TestDatabase.requireUrl(environment)).isInstanceOf(IllegalArgumentException.class);
+        environment.put("TEST_DB_URL", "jdbc:postgresql://remote.example/sharing_platform_test");
+        environment.put("DB_URL", environment.get("TEST_DB_URL"));
+        assertThatThrownBy(() -> TestDatabase.requireUrl(environment)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
