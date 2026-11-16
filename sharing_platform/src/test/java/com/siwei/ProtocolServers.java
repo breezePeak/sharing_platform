@@ -18,7 +18,7 @@ import org.apache.sshd.sftp.server.*;
 
 /** Real servers, loopback only, disposable credentials and files. No Docker/customer endpoints. */
 public final class ProtocolServers implements AutoCloseable {
-    public enum Mode { NORMAL, READ_ONLY, WRITE_ONLY, BROKEN_DATA, CLEANUP_FAIL, RENAME_FAIL, STALL_READ, SLOW_COMMANDS, LINK_ATTRIBUTES }
+    public enum Mode { NORMAL, READ_ONLY, WRITE_ONLY, BROKEN_DATA, CLEANUP_FAIL, RENAME_FAIL, STALL_READ, SLOW_COMMANDS, LINK_ATTRIBUTES, DENY_SOURCE }
     public static final String PASSWORD = "test-only-password";
     public final Path root;
     public final int port;
@@ -32,6 +32,10 @@ public final class ProtocolServers implements AutoCloseable {
         this.root = root;
         Files.createDirectories(root.resolve("probe"));
         Files.writeString(root.resolve("sample.bin"), "non-empty test content\r\n\u0000\u00ff");
+        if (mode == Mode.DENY_SOURCE) {
+            Files.createDirectories(root.resolve("pull")); Files.createDirectories(root.resolve("push/probe"));
+            Files.writeString(root.resolve("pull/source.bin"), "restricted source content");
+        }
         KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA"); generator.initialize(2048);
         hostKey = generator.generateKeyPair(); userKey = generator.generateKeyPair();
         fingerprint = KeyUtils.getFingerPrint(hostKey.getPublic());
@@ -49,6 +53,7 @@ public final class ProtocolServers implements AutoCloseable {
                         try { Thread.sleep(750); } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException("test interrupted"); }
                     }
                     boolean deny = mode == Mode.READ_ONLY && Arrays.asList("STOR", "MKD", "RNFR", "RNTO", "DELE", "RMD").contains(command)
+                            || mode == Mode.DENY_SOURCE && command.equals("RETR") && request.getArgument().equals("/pull/source.bin")
                             || mode == Mode.WRITE_ONLY && command.equals("RETR")
                             || mode == Mode.BROKEN_DATA && Arrays.asList("LIST", "MLSD", "RETR", "STOR").contains(command)
                             || mode == Mode.CLEANUP_FAIL && Arrays.asList("DELE", "RMD").contains(command)
@@ -88,7 +93,9 @@ public final class ProtocolServers implements AutoCloseable {
                     if (handle instanceof FileHandle) {
                         Set<StandardOpenOption> options = ((FileHandle) handle).getOpenOptions();
                         if (mode == Mode.READ_ONLY && options.contains(StandardOpenOption.WRITE)
-                                || mode == Mode.WRITE_ONLY && options.contains(StandardOpenOption.READ)) throw new AccessDeniedException("test");
+                                || mode == Mode.WRITE_ONLY && options.contains(StandardOpenOption.READ)
+                                || mode == Mode.DENY_SOURCE && handle.getFile().getFileName().toString().equals("source.bin")
+                                    && options.contains(StandardOpenOption.READ)) throw new AccessDeniedException("test");
                     }
                 }
                 @Override public void creating(ServerSession session, Path path, Map<String, ?> attrs) throws IOException {

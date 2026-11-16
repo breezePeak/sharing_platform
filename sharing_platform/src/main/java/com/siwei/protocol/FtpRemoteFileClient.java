@@ -1,16 +1,44 @@
 package com.siwei.protocol;
 
 import java.io.*;
+import java.net.*;
 import java.time.Duration;
 import java.util.*;
+import javax.net.ServerSocketFactory;
 import com.siwei.endpoint.EndpointRevision;
+import org.apache.commons.net.DefaultSocketFactory;
 import org.apache.commons.net.ftp.*;
 
 final class FtpRemoteFileClient extends ScopedRemoteClient {
     private final FTPClient ftp = new FTPClient();
+    private final Set<Closeable> sockets = new HashSet<>();
+    private boolean closed;
     FtpRemoteFileClient(EndpointRevision config, String password) throws IOException {
         super(config);
         if (!config.isolatedFtpRoot) throw new IOException("FTP_ISOLATED_ACCOUNT_REQUIRED");
+        // Commons Net 3.13 uses this factory for both control and passive data sockets, before connect/handshake.
+        ftp.setSocketFactory(new DefaultSocketFactory() {
+            @Override public Socket createSocket() throws IOException { return newSocket(); }
+        });
+        ftp.setServerSocketFactory(new ServerSocketFactory() {
+            @Override public ServerSocket createServerSocket(int port) throws IOException { return createServerSocket(port, 50, null); }
+            @Override public ServerSocket createServerSocket(int port, int backlog) throws IOException { return createServerSocket(port, backlog, null); }
+            @Override public ServerSocket createServerSocket(int port, int backlog, InetAddress address) throws IOException {
+                ServerSocket server = track(new ServerSocket() {
+                    @Override public Socket accept() throws IOException {
+                        return track(super.accept());
+                    }
+                    @Override public void close() throws IOException {
+                        try { super.close(); } finally { untrack(this); }
+                    }
+                });
+                try { server.bind(new InetSocketAddress(address, port), backlog); return server; }
+                catch (IOException | RuntimeException failure) {
+                    try { server.close(); } catch (IOException closing) { failure.addSuppressed(closing); }
+                    throw failure;
+                }
+            }
+        });
         ftp.setConnectTimeout(config.timeoutSeconds * 1000);
         ftp.setDefaultTimeout(config.timeoutSeconds * 1000);
         ftp.setDataTimeout(Duration.ofSeconds(config.timeoutSeconds));
@@ -22,8 +50,30 @@ final class FtpRemoteFileClient extends ScopedRemoteClient {
             require(ftp.login(config.username, password), "AUTHENTICATION");
             require(ftp.setFileType(FTP.BINARY_FILE_TYPE), "BINARY_TYPE");
             if (config.passive) ftp.enterLocalPassiveMode(); else ftp.enterLocalActiveMode();
-        } catch (IOException | RuntimeException e) { close(); throw e; }
+        } catch (IOException | RuntimeException e) {
+            try { close(); } catch (IOException closing) { e.addSuppressed(closing); }
+            throw e;
+        }
     }
+
+    private Socket newSocket() throws IOException {
+        return track(new Socket() {
+            @Override public void close() throws IOException {
+                try { super.close(); } finally { untrack(this); }
+            }
+        });
+    }
+    private <T extends Closeable> T track(T socket) throws IOException {
+        synchronized (sockets) {
+            if (!closed) {
+                sockets.removeIf(value -> value instanceof Socket && ((Socket) value).isClosed());
+                sockets.add(socket); return socket;
+            }
+        }
+        socket.close();
+        throw new IOException("FTP_CLIENT_CLOSED");
+    }
+    private void untrack(Closeable socket) { synchronized (sockets) { sockets.remove(socket); } }
 
     private void require(boolean success, String stage) throws IOException {
         if (!success) throw new IOException(stage + "_FTP_" + ftp.getReplyCode());
@@ -93,5 +143,22 @@ final class FtpRemoteFileClient extends ScopedRemoteClient {
         require(directory ? ftp.removeDirectory(path) : ftp.deleteFile(path), "CLEANUP");
     }
     @Override public String pathAssurance() { return "LIMITED_FTP_ISOLATED_ACCOUNT"; }
-    @Override public void close() throws IOException { if (ftp.isConnected()) ftp.disconnect(); }
+    @Override public void close() throws IOException {
+        List<Closeable> active;
+        synchronized (sockets) {
+            if (closed) return;
+            closed = true;
+            active = new ArrayList<>(sockets);
+            sockets.clear();
+        }
+        // Abort sockets first: closing buffered remote output here could flush and block the shared deadline thread.
+        IOException failure = null;
+        for (Closeable socket : active) {
+            try { socket.close(); }
+            catch (IOException e) { if (failure == null) failure = e; else failure.addSuppressed(e); }
+        }
+        try { ftp.disconnect(); }
+        catch (IOException e) { if (failure == null) failure = e; else failure.addSuppressed(e); }
+        if (failure != null) throw failure;
+    }
 }

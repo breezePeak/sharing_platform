@@ -118,7 +118,6 @@ public class ProbeRunner {
                         Digest sink = new Digest(bytes.length); client.read(payload, sink);
                         if (sink.count != bytes.length || !MessageDigest.isEqual(sink.hash.digest(), sha256().digest(bytes)))
                             throw new IOException("CONTENT_MISMATCH");
-                        p.canRead = true;
                     });
                     residuals.add(renamed); progress();
                     p.canRename = stage("RENAME", () -> {

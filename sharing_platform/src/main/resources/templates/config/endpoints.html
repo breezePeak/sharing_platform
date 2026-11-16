@@ -8,6 +8,7 @@
   <p class="eyebrow">平台配置</p><h1>FTP / SFTP 连接</h1>
   <p><a class="button" th:href="@{/config/endpoints/new}">新增连接</a></p>
   <p>检测异步执行，刷新页面查看结果。旧版本结果不代表当前配置可用，每次任务仍需预检查。监听与任务业务尚未开放。</p>
+  <p>读源检测只表示配置的读取测试对象已通过；写入目标的回读仅用于目标完整性验证，两者互不替代。</p>
   <section class="empty" th:if="${#lists.isEmpty(rows)}"><h2>暂无连接</h2><p>新增连接后可检测实际读写、回读校验及重命名能力。</p></section>
   <article class="panel" th:each="row : ${rows}">
     <h2><a th:href="@{/config/endpoints/{id}(id=${row.id})}" th:text="${row.name}">连接</a></h2>
@@ -29,8 +30,8 @@
       <p th:if="${row.stale}" class="notice">检测已过期：以下属于旧配置版本，请重新检测。</p>
       <p>检测时间 <span th:text="${row.probe.startedAt}"></span> · 状态 <strong th:text="${row.probe.status}"></strong>
         · 检测版本编号 <code th:text="${row.probe.revisionId}"></code></p>
-      <p>读取 <span th:text="${row.probe.canRead}"></span> · 写入 <span th:text="${row.probe.canWrite}"></span>
-        · 完整性 <span th:text="${row.probe.verified}"></span> · 重命名 <span th:text="${row.probe.canRename}"></span>
+      <p>读源检测 <span th:text="${row.probe.canRead}"></span> · 写入 <span th:text="${row.probe.canWrite}"></span>
+        · 写入目标完整性 <span th:text="${row.probe.verified}"></span> · 重命名 <span th:text="${row.probe.canRename}"></span>
         · 容量 <span th:text="${row.probe.capacity}"></span></p>
       <p th:if="${!row.stale}" th:text="${row.probe.strictPush ? '满足本次探测的严格推送条件' : '尚不满足严格推送条件；只读连接可单独用于拉取'}"></p>
       <details><summary>阶段与原因</summary><pre th:text="${row.probe.details}"></pre></details>

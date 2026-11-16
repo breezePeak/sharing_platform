@@ -126,6 +126,68 @@ class EndpointIT {
         }
     }
 
+    @Test void totalDeadlineStopsBothContinuousTransfersAndReleasesWorkerSlots() throws Exception {
+        try (StreamingFtpServer streaming = new StreamingFtpServer(StreamingFtpServer.Fault.RETR);
+             ProtocolServers normal = new ProtocolServers(root, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm f = normal.form(EndpointRevision.Protocol.FTP);
+            f.port = streaming.port(); f.timeoutSeconds = 1; f.concurrency = 2; f.writeRoot = null; f.probeDirectory = null;
+            String id = service.save(null, f);
+            String first = runner.start(id, 1), second = runner.start(id, 1);
+            StreamingFtpServer.await(() -> streaming.started.get() == 2 && streaming.bytes.get() >= 32768, Duration.ofSeconds(3));
+            var workers = (java.util.concurrent.ThreadPoolExecutor) org.springframework.test.util.ReflectionTestUtils.getField(runner, "workers");
+            assertThat(workers.getActiveCount()).isEqualTo(2);
+            String next = service.save(null, normal.form(EndpointRevision.Protocol.FTP));
+            assertThatThrownBy(() -> runner.start(next, 1)).isInstanceOfSatisfying(org.springframework.web.server.ResponseStatusException.class,
+                    e -> assertThat(e.getStatus()).isEqualTo(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS));
+            assertThat(finish(first).status).isEqualTo("TIMED_OUT");
+            assertThat(finish(second).status).isEqualTo("TIMED_OUT");
+            StreamingFtpServer.await(() -> streaming.stopped.get() == 2 && workers.getActiveCount() == 0, Duration.ofSeconds(3));
+            long stoppedBytes = streaming.bytes.get();
+            EndpointProbe accepted = finish(runner.start(next, 1));
+            assertThat(accepted.status).as(accepted.details).isEqualTo("COMPLETED");
+            assertThat(accepted.isStrictPush()).as(accepted.details).isTrue();
+            assertThat(streaming.bytes.get()).isEqualTo(stoppedBytes);
+            assertThat(probes.findById(first).orElseThrow().status).isEqualTo("TIMED_OUT");
+            assertThat(probes.findById(second).orElseThrow().status).isEqualTo("TIMED_OUT");
+            assertThat(streaming.failures).isEmpty();
+        }
+    }
+
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void failedSourceReadIsNotOverriddenBySuccessfulTargetReadback(EndpointRevision.Protocol protocol) throws Exception {
+        try (ProtocolServers server = new ProtocolServers(root, protocol, ProtocolServers.Mode.DENY_SOURCE)) {
+            EndpointForm f = server.form(protocol);
+            f.readRoot = "/pull"; f.readTestFile = "source.bin"; f.writeRoot = "/push";
+            String id = service.save(null, f);
+            EndpointProbe p = finish(runner.start(id, 1));
+            assertThat(p.status).as(p.details).isEqualTo("COMPLETED");
+            assertThat(p.canRead).as(p.details).isFalse();
+            assertThat(p.details).contains(protocol == EndpointRevision.Protocol.FTP ? "READ: READ_OPEN_FTP_550" : "READ: SFTP_STATUS_3");
+            assertThat(p.canWrite).as(p.details).isTrue(); assertThat(p.verified).as(p.details).isTrue();
+            assertThat(p.canRename).isTrue(); assertThat(p.residuals).isEmpty(); assertThat(p.isStrictPush()).isTrue();
+            String html = mvc.perform(get("/config/endpoints")).andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+            String row = html.substring(html.indexOf("连接编号：<code>" + id));
+            row = row.substring(0, row.indexOf("</article>"));
+            assertThat(row).contains("读源检测 <span>false</span>", "写入目标完整性 <span>true</span>", "READ:", "满足本次探测的严格推送条件");
+        }
+    }
+
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void targetReadbackDoesNotClaimAnUnconfiguredSourceWasRead(EndpointRevision.Protocol protocol) throws Exception {
+        try (ProtocolServers server = new ProtocolServers(root, protocol, ProtocolServers.Mode.DENY_SOURCE)) {
+            for (String readRoot : new String[] {"/pull", null}) {
+                EndpointForm f = server.form(protocol);
+                f.readRoot = readRoot; f.readTestFile = null; f.writeRoot = "/push";
+                String id = service.save(null, f);
+                EndpointProbe p = finish(runner.start(id, 1));
+                assertThat(p.canRead).as(p.details).isFalse();
+                assertThat(p.canWrite).as(p.details).isTrue(); assertThat(p.verified).as(p.details).isTrue();
+                assertThat(p.isStrictPush()).isTrue();
+                if (readRoot != null) assertThat(p.details).contains("READ: NOT_TESTED_SPECIFY_TEST_OBJECT");
+            }
+        }
+    }
+
     @Test void snapshotsSurviveRestartRetainOldCredentialsAndOldProbeIsStale() throws Exception {
         String id, originalRevision, ftpId;
         try (ProtocolServers server = new ProtocolServers(root, EndpointRevision.Protocol.SFTP, ProtocolServers.Mode.NORMAL)) {
