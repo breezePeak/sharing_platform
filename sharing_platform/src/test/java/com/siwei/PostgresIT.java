@@ -80,6 +80,32 @@ class PostgresIT {
         }
     }
 
+    @Test void v4FrozenPushSurvivesUpgradeWithoutRefreezingOrLosingProgress() throws Exception {
+        String schema = SCHEMA + "_push_upgrade";
+        try {
+            Flyway.configure().dataSource(URL, USER, PASSWORD).defaultSchema(schema)
+                    .locations("classpath:db/migration").target("4").load().migrate();
+            // Migration fixtures intentionally use independent SQL against the V4 schema, before JPA's new columns exist.
+            try (var connection = DriverManager.getConnection(URL, USER, PASSWORD); var sql = connection.createStatement()) {
+                sql.execute("SET search_path TO " + schema);
+                sql.execute("INSERT INTO endpoint(id,revision,enabled) VALUES ('upgrade-endpoint',1,true)");
+                sql.execute("INSERT INTO endpoint_revision(id,endpoint_id,revision,name,protocol,host,port,username,auth,timeout_seconds,concurrency,passive,isolated_ftp_root,created_at) VALUES ('upgrade-revision','upgrade-endpoint',1,'upgrade','FTP','127.0.0.1',21,'test','PASSWORD',1,1,true,true,now())");
+                sql.execute("INSERT INTO transfer_task(id,caller_id,external_task_id,entry_type,direction,endpoint_id,endpoint_revision_id,notification_url,canonical_request,raw_request,status,phase,next_run_at,created_at,updated_at,push_manifest_sha256,push_source_root,push_target_root) VALUES ('upgrade-task','test','upgrade','JSON','PUSH','upgrade-endpoint','upgrade-revision','http://127.0.0.1/notify','{}','{}','QUEUED','RETRY_WAIT',now(),now(),now(),repeat('a',64),'/source','/target')");
+                sql.execute("INSERT INTO transfer_file(task_id,product_id,relative_path,size_bytes,sha256,source_modified_millis,uploaded_bytes,verified) VALUES ('upgrade-task','p','a.bin',7,repeat('b',64),1234,7,true)");
+            }
+            assertThat(Flyway.configure().dataSource(URL, USER, PASSWORD).defaultSchema(schema)
+                    .locations("classpath:db/migration").load().migrate().migrationsExecuted).isEqualTo(2);
+            try (var connection = DriverManager.getConnection(URL, USER, PASSWORD); var sql = connection.createStatement();
+                 var row = sql.executeQuery("SELECT t.push_manifest_sha256,t.push_target_root,t.push_manifest,t.push_manifest_intent,f.uploaded_bytes,f.verified,f.upload_traffic_bytes,f.readback_bytes FROM "
+                         + schema + ".transfer_task t JOIN " + schema + ".transfer_file f ON f.task_id=t.id WHERE t.id='upgrade-task'")) {
+                assertThat(row.next()).isTrue(); assertThat(row.getString(1)).isEqualTo("a".repeat(64));
+                assertThat(row.getString(2)).isEqualTo("/target"); assertThat(row.getString(3)).isNull();
+                assertThat(row.getBoolean(4)).isTrue(); assertThat(row.getLong(5)).isEqualTo(7); assertThat(row.getBoolean(6)).isTrue();
+                assertThat(row.getLong(7)).isZero(); assertThat(row.getLong(8)).isZero();
+            }
+        } finally { dropSchema(schema); }
+    }
+
     @Test
     void olderSchemaUpgradesWithoutLosingDataAndInvalidMigrationFails() throws Exception {
         String upgradeSchema = SCHEMA + "_upgrade";
@@ -89,7 +115,7 @@ class PostgresIT {
             assertThat(original.migrate().migrationsExecuted).isEqualTo(1);
             Flyway upgraded = Flyway.configure().dataSource(URL, USER, PASSWORD).defaultSchema(upgradeSchema)
                     .locations("classpath:db/migration", "classpath:db/upgrade").load();
-            assertThat(upgraded.migrate().migrationsExecuted).isEqualTo(4);
+            assertThat(upgraded.migrate().migrationsExecuted).isEqualTo(6);
             try (var connection = DriverManager.getConnection(URL, USER, PASSWORD);
                  var statement = connection.createStatement()) {
                 try (var result = statement.executeQuery("SELECT value, description FROM " + upgradeSchema
@@ -117,7 +143,7 @@ class PostgresIT {
     }
 
     private static void dropSchema(String schema) throws Exception {
-        if (!schema.matches("foundation_it_[a-f0-9]{32}(_upgrade)?")) {
+        if (!schema.matches("foundation_it_[a-f0-9]{32}(_(?:push_)?upgrade)?")) {
             throw new IllegalArgumentException("Refusing to clean a non-test schema");
         }
         try (var connection = DriverManager.getConnection(URL, USER, PASSWORD);

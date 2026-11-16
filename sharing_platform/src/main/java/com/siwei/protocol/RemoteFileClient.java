@@ -8,9 +8,14 @@ public interface RemoteFileClient extends AutoCloseable {
     final class Entry {
         public final String name;
         public final long size;
+        public final Long modifiedMillis;
         public final boolean directory, regular, link;
         public Entry(String name, long size, boolean directory, boolean regular, boolean link) {
+            this(name, size, directory, regular, link, null);
+        }
+        public Entry(String name, long size, boolean directory, boolean regular, boolean link, Long modifiedMillis) {
             this.name = name; this.size = size; this.directory = directory; this.regular = regular; this.link = link;
+            this.modifiedMillis = modifiedMillis;
         }
     }
     List<Entry> list(String path) throws IOException;

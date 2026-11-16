@@ -67,7 +67,8 @@ final class SftpRemoteFileClient extends ScopedRemoteClient {
         }
     }
     private Entry entry(String name, SftpClient.Attributes a) {
-        return new Entry(name, a.getSize(), a.isDirectory(), a.isRegularFile(), a.isSymbolicLink());
+        return new Entry(name, a.getSize(), a.isDirectory(), a.isRegularFile(), a.isSymbolicLink(),
+                a.getModifyTime() == null ? null : a.getModifyTime().toMillis());
     }
     @Override public Entry lstat(String path) throws IOException { authorize(path, false, true); return entry(path, sftp.lstat(path)); }
     @Override public List<Entry> list(String path) throws IOException {

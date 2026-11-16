@@ -45,23 +45,26 @@ public class TaskWorker {
     public void poll() {
         int capacity = executor.getMaximumPoolSize() - executor.getActiveCount();
         if (capacity <= 0) return;
-        List<Map<String, Object>> due = db.dueTasks(capacity + active.size() + 100);
         int launched = 0;
-        for (Map<String, Object> row : due) {
-            if (launched >= capacity) break;
-            String id = (String) row.get("id"), direction = (String) row.get("direction");
-            if (!processors.containsKey(direction)) continue;
-            String claim = UUID.randomUUID().toString();
-            if (active.putIfAbsent(id, claim) != null) continue;
-            int updated;
-            try { updated = db.claimTask(id, claim); }
-            catch (RuntimeException e) { active.remove(id, claim); throw e; }
-            if (updated == 0) { active.remove(id, claim); continue; }
-            try { executor.execute(() -> run(id, claim, processors.get(direction))); launched++; }
-            catch (RejectedExecutionException e) {
-                active.remove(id, claim);
-                db.releaseTaskClaim(id, claim);
+        for (int offset = 0; launched < capacity; offset += 100) {
+            List<Map<String, Object>> due = db.dueTasks(100, offset);
+            for (Map<String, Object> row : due) {
+                if (launched >= capacity) break;
+                String id = (String) row.get("id"), direction = (String) row.get("direction");
+                if (!processors.containsKey(direction)) continue;
+                String claim = UUID.randomUUID().toString();
+                if (active.putIfAbsent(id, claim) != null) continue;
+                int updated;
+                try { updated = db.claimTask(id, claim); }
+                catch (RuntimeException e) { active.remove(id, claim); throw e; }
+                if (updated == 0) { active.remove(id, claim); continue; }
+                try { executor.execute(() -> run(id, claim, processors.get(direction))); launched++; }
+                catch (RejectedExecutionException e) {
+                    active.remove(id, claim);
+                    db.releaseTaskClaim(id, claim);
+                }
             }
+            if (due.size() < 100) break;
         }
     }
 
@@ -76,9 +79,9 @@ public class TaskWorker {
         try {
             String caller = taskRecords.findById(id).orElseThrow().callerId;
             task = tasks.get(caller, id);
-            // shortcut: PULL still needs external-effect reconciliation after a lost result commit; add it with PR5.
+            if (!claim.equals(task.claimId)) return;
             result = processor.process(task);
-            if (!Set.of("SUCCEEDED", "FAILED", "REJECTED", "WAITING_FEEDBACK", "RECONCILING").contains(result.status))
+            if (!Set.of("SUCCEEDED", "FAILED", "REJECTED", "WAITING_FEEDBACK", "RECONCILING", "WAITING_SOURCE", "WAITING_ACCEPTANCE", "NO_NEW_DATA").contains(result.status))
                 throw new IllegalArgumentException("Invalid processor result");
         } catch (Exception error) {
             try {
@@ -87,8 +90,8 @@ public class TaskWorker {
                 boolean publishing = record.pushPublishIntent;
                 if (publishing) {
                     result = new TaskProcessor.Result("RECONCILING", "PUBLISHING", "PUBLICATION_UNKNOWN", null);
-                } else if (error instanceof IOException && !(error instanceof PushProcessor.SourceChanged)
-                        && attempts < (task != null && task.direction.equals("PUSH") ? 4 : 3)) {
+                } else if (error instanceof IOException && !(error instanceof PushProcessor.SourceChanged) && !(error instanceof PullProcessor.InvalidSource)
+                        && attempts < 4) {
                     db.retryTask(id, claim, safe(error), java.sql.Timestamp.from(Instant.now().plusSeconds(5L * attempts)));
                     return;
                 }
@@ -115,6 +118,10 @@ public class TaskWorker {
     }
 
     private void finish(Task task, String claim, TaskProcessor.Result result) {
+        if (task.direction.equals("PULL") && Set.of("WAITING_SOURCE", "WAITING_ACCEPTANCE", "NO_NEW_DATA", "SUCCEEDED").contains(result.status)) {
+            ((PullProcessor) processors.get("PULL")).finish(task.taskRecordId, claim);
+            return;
+        }
         tx.executeWithoutResult(status -> {
             int updated = db.finishTask(task.taskRecordId, claim, result);
             if (updated == 0 || result.status.equals("RECONCILING")) return;

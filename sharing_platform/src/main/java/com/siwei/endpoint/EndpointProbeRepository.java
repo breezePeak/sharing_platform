@@ -7,7 +7,6 @@ import org.springframework.data.repository.query.Param;
 
 public interface EndpointProbeRepository extends JpaRepository<EndpointProbe, String> {
     Optional<EndpointProbe> findFirstByEndpointIdOrderByStartedAtDesc(String endpointId);
-    long countByEndpointIdAndStatus(String endpointId, String status);
     List<EndpointProbe> findByStatus(String status);
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select p from EndpointProbe p where p.id = :id")

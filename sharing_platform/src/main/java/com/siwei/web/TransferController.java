@@ -47,7 +47,7 @@ public class TransferController {
         return service.files(service.authenticate(authorization), id, page, size);
     }
 
-    private static String body(HttpServletRequest request) {
+    static String body(HttpServletRequest request) {
         if (request.getContentLengthLong() > 32768) throw new ResponseStatusException(HttpStatus.PAYLOAD_TOO_LARGE, "REQUEST_TOO_LARGE");
         try {
             byte[] bytes = request.getInputStream().readNBytes(32769);

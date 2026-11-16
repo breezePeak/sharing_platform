@@ -101,7 +101,10 @@ final class FtpRemoteFileClient extends ScopedRemoteClient {
             if (file.isSymbolicLink() || (!file.isDirectory() && !file.isFile())) throw new IOException("LINK_OR_SPECIAL_FILE");
         }
     }
-    private Entry entry(FTPFile f) { return new Entry(f.getName(), f.getSize(), f.isDirectory(), f.isFile(), f.isSymbolicLink()); }
+    private Entry entry(FTPFile f) {
+        return new Entry(f.getName(), f.getSize(), f.isDirectory(), f.isFile(), f.isSymbolicLink(),
+                f.getTimestamp() == null ? null : f.getTimestamp().getTimeInMillis());
+    }
     @Override public Entry lstat(String path) throws IOException { authorize(path, false, true); return entry(raw(path)); }
     @Override public List<Entry> list(String path) throws IOException {
         authorize(path, false, true);

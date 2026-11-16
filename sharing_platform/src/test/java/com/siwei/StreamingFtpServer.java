@@ -11,7 +11,7 @@ import java.util.function.BooleanSupplier;
 
 /** Real loopback FTP wire fixture: control disconnect deliberately does not stop an active data transfer. */
 public final class StreamingFtpServer implements AutoCloseable {
-    public enum Fault { RETR, STOR, LIST, OPENING, ACTIVE_ACCEPT, WELCOME, AUTH }
+    public enum Fault { RETR, STOR, STALLED_STOR, LIST, OPENING, ACTIVE_ACCEPT, WELCOME, AUTH }
     private final ServerSocket listener = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"));
     private final Set<Closeable> resources = ConcurrentHashMap.newKeySet();
     private final ExecutorService handlers = Executors.newCachedThreadPool(r -> { Thread t = new Thread(r, "ftp-wire-fixture"); t.setDaemon(true); return t; });
@@ -95,7 +95,11 @@ public final class StreamingFtpServer implements AutoCloseable {
                                 if (!releaseOpening.await(10, TimeUnit.SECONDS)) throw new IOException("Opening test deadline");
                             }
                             reply(output, "150 data transfer");
-                            if (command.equals(fault.name())) stream(channel, command);
+                            if (fault == Fault.STALLED_STOR && command.equals("STOR")) {
+                                started.incrementAndGet();
+                                try { connection.getInputStream().read(); } // Consume no data; observe client closing control.
+                                finally { stopped.incrementAndGet(); }
+                            } else if (command.equals(fault.name())) stream(channel, command);
                             else channel.getOutputStream().write("-rw-r--r-- 1 owner group 1 Jan 01 2026 sample.bin\r\n".getBytes(StandardCharsets.UTF_8));
                         } finally { resources.remove(data); }
                         reply(output, "226 completed"); break;

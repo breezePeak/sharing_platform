@@ -13,11 +13,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
 import org.w3c.dom.*;
-import org.xml.sax.InputSource;
 
 @Service
 public class TaskService {
-    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products", "fileCount");
+    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products", "fileCount");
     private final ObjectMapper json;
     private final TransferJpa db;
     private final TransferTaskRepository taskRecords;
@@ -29,17 +28,20 @@ public class TaskService {
     private final EndpointRevisionRepository revisions;
     private final EndpointSettings endpointSettings;
     private final List<TaskProcessor> processors;
+    private final PullSettings pulls;
+    private final PullStore pullStore;
 
     public TaskService(ObjectMapper json, TransferJpa db, TransferTaskRepository taskRecords,
                        TransferProductRepository productRecords, TransferNotificationRepository notificationRecords,
                        org.springframework.transaction.PlatformTransactionManager transactionManager,
                        TransferSettings settings, EndpointRepository endpoints, EndpointRevisionRepository revisions,
                        EndpointSettings endpointSettings,
-                       List<TaskProcessor> processors) {
+                       List<TaskProcessor> processors, PullSettings pulls, PullStore pullStore) {
         this.json = json; this.db = db; this.taskRecords = taskRecords; this.productRecords = productRecords;
         this.notificationRecords = notificationRecords; this.tx = new TransactionTemplate(transactionManager);
         this.settings = settings; this.endpoints = endpoints; this.revisions = revisions;
         this.endpointSettings = endpointSettings; this.processors = processors;
+        this.pulls = pulls; this.pullStore = pullStore;
     }
 
     public String authenticate(String authorization) {
@@ -57,7 +59,7 @@ public class TaskService {
         limit(raw);
         try {
             JsonNode node = json.readTree(raw);
-            if (!node.isObject()) throw invalid();
+            if (node == null || !node.isObject()) throw invalid();
             return (ObjectNode) node;
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) { throw invalid(); }
     }
@@ -129,19 +131,32 @@ public class TaskService {
             if (!FIELDS.contains(field) && !(entry.equals("XML") && field.equals("type"))) throw invalid();
         }
         Task previous = findByExternal(caller, taskId);
+        String type = input.hasNonNull("type") ? required(input, "type", 100)
+                : input.hasNonNull("sourceCode") ? required(input, "sourceCode", 100) : null;
+        TransferSettings.Route route = type == null ? null : config.getRoutes().get(type);
         String endpointId = entry.equals("XML")
-                ? previous == null ? config.getXmlRoutes().get(required(input, "type", 100)) : previous.endpointId
+                ? previous == null ? route == null ? config.getXmlRoutes().get(required(input, "type", 100)) : route.getEndpointId() : previous.endpointId
                 : required(input, "endpointId", 36);
         if (endpointId == null) throw error(HttpStatus.BAD_REQUEST, "ROUTE_NOT_CONFIGURED");
         String canonical = canonical(input, endpointId);
         if (previous != null) return compare(previous, canonical);
+        if (route != null) {
+            if (!direction.equals("PUSH") || !route.isEnabled()) throw error(HttpStatus.BAD_REQUEST, "ROUTE_DISABLED");
+            if (!endpointId.equals(route.getEndpointId()) || route.getVersion() == null || route.getVersion().isBlank()
+                    || route.getSourceRoot() == null || route.getTargetRoot() == null) throw error(HttpStatus.BAD_REQUEST, "ROUTE_NOT_CONFIGURED");
+            String target = required(input, "targetPath", 1000);
+            try { ControlledPaths.relative(route.getTargetRoot()); } catch (IllegalArgumentException e) { throw invalid(); }
+            if (!target.equals(route.getTargetRoot()) && !target.startsWith(route.getTargetRoot() + "/")) throw invalid();
+        }
         if (!config.getEndpointIds().contains(endpointId)) throw error(HttpStatus.FORBIDDEN, "ENDPOINT_FORBIDDEN");
         if (direction.equals("PUSH") && !settings.isPushIntakeEnabled()) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
+        if (direction.equals("PULL") && !pulls.isIntakeEnabled()) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
         if (processors.stream().noneMatch(p -> p.direction().equals(direction))) throw error(HttpStatus.SERVICE_UNAVAILABLE, "ENGINE_NOT_READY");
-        if (config.getNotificationUrl() == null || config.getNotificationUrl().isBlank())
+        String recipient = route != null && route.getNotificationUrl() != null ? route.getNotificationUrl() : config.getNotificationUrl();
+        if (recipient == null || recipient.isBlank())
             throw error(HttpStatus.SERVICE_UNAVAILABLE, "NOTIFICATION_NOT_CONFIGURED");
         java.net.URI notificationUrl;
-        try { notificationUrl = java.net.URI.create(config.getNotificationUrl()); }
+        try { notificationUrl = java.net.URI.create(recipient); }
         catch (IllegalArgumentException e) { throw error(HttpStatus.SERVICE_UNAVAILABLE, "NOTIFICATION_NOT_CONFIGURED"); }
         if (!Set.of("http", "https").contains(notificationUrl.getScheme()) || notificationUrl.getHost() == null
                 || notificationUrl.getUserInfo() != null || notificationUrl.getFragment() != null)
@@ -151,14 +166,25 @@ public class TaskService {
             Endpoint endpoint = endpoints.lockById(endpointId).orElseThrow(() -> error(HttpStatus.BAD_REQUEST, "ENDPOINT_NOT_FOUND"));
             if (!endpoint.enabled) throw error(HttpStatus.BAD_REQUEST, "ENDPOINT_DISABLED");
             EndpointRevision revision = revisions.findByEndpointIdAndRevision(endpointId, endpoint.revision).orElseThrow();
-            try { validateScope(input, direction, revision); }
+            try { validateScope(input, direction, revision, route); }
             catch (IllegalArgumentException e) { throw invalid(); }
             String sourceRoot = null;
             if (direction.equals("PUSH")) try {
-                sourceRoot = ControlledPaths.localDirectory(endpointSettings.getLocalRoots().get(revision.localSourceRef)).toString();
+                sourceRoot = ControlledPaths.localDirectory(endpointSettings.getLocalRoots().get(route == null ? revision.localSourceRef : route.getSourceRoot())).toString();
             } catch (java.io.IOException | IllegalArgumentException e) { throw invalid(); }
             int count = db.insertTask(id, caller, taskId, entry, direction, endpointId, revision.id,
                     notificationUrl.toString(), canonical, raw, sourceRoot, now);
+            if (count == 1 && direction.equals("PUSH")) {
+                ObjectNode snapshot = json.createObjectNode().put("callerId", caller).put("type", type)
+                        .put("enabled", true).put("version", route == null ? "legacy-1" : route.getVersion())
+                        .put("endpointId", endpointId).put("endpointRevisionId", revision.id)
+                        .put("sourceRoot", sourceRoot).put("sourceRef", route == null ? revision.localSourceRef : route.getSourceRoot())
+                        .put("targetRoot", route == null ? revision.writeRoot : ControlledPaths.resolve(revision.writeRoot, route.getTargetRoot()))
+                        .put("notificationUrl", notificationUrl.toString());
+                TransferTaskRecord insertedTask = taskRecords.findById(id).orElseThrow();
+                insertedTask.pushRouteSnapshot = snapshot.toString();
+                taskRecords.save(insertedTask);
+            }
             if (count == 1 && input.has("products")) {
                 JsonNode products = input.get("products");
                 for (int i = 0; i < products.size(); i++) {
@@ -170,6 +196,8 @@ public class TaskService {
                     productRecords.save(record);
                 }
             }
+            if (count == 1 && direction.equals("PULL")) pullStore.snapshot(id, required(input, "sourceId", 100),
+                    pulls.snapshot(json, input, revision, caller, endpointSettings, settings));
             return count;
         });
         if (inserted == 0) {
@@ -193,7 +221,7 @@ public class TaskService {
             if (!code.matches("[A-Za-z0-9][A-Za-z0-9._-]{0,99}")) throw invalid();
             value.put("sourceCode", code);
         }
-        for (String field : List.of("sourceRoot", "sourcePath", "targetPath")) {
+        for (String field : List.of("sourceId", "sourceRoot", "sourcePath", "targetPath")) {
             JsonNode node = input.get(field);
             if (node != null && !node.isNull()) value.put(field, required(input, field, 1000));
         }
@@ -221,10 +249,11 @@ public class TaskService {
         return value.toString();
     }
 
-    private void validateScope(ObjectNode input, String direction, EndpointRevision revision) {
+    private void validateScope(ObjectNode input, String direction, EndpointRevision revision, TransferSettings.Route route) {
         if (direction.equals("PUSH")) {
-            if (revision.writeRoot == null || revision.localSourceRef == null) throw invalid();
-            if (!required(input, "sourceRoot", 100).equals(revision.localSourceRef)) throw invalid();
+            if (input.has("sourceId") || input.has("sourcePath")) throw invalid();
+            if (revision.writeRoot == null || (route == null && revision.localSourceRef == null)) throw invalid();
+            if (!required(input, "sourceRoot", 100).equals(route == null ? revision.localSourceRef : route.getSourceRoot())) throw invalid();
             ControlledPaths.resolve(revision.writeRoot, required(input, "targetPath", 1000));
             JsonNode products = input.get("products");
             if (products == null || !products.isArray() || products.isEmpty()) throw invalid();
@@ -234,6 +263,7 @@ public class TaskService {
                 ControlledPaths.relative(required(product, "productPath", 1000));
             }
         } else {
+            required(input, "sourceId", 100);
             if (revision.readRoot == null || revision.localTargetRef == null) throw invalid();
             ControlledPaths.resolve(revision.readRoot, required(input, "sourcePath", 1000));
             if (!required(input, "targetPath", 100).equals(revision.localTargetRef)) throw invalid();
@@ -259,11 +289,26 @@ public class TaskService {
             row.put("attempts", notice.attempts); row.put("last_error", notice.lastError);
             task.notifications.add(row);
         }
+        if (record.pullConfig != null) {
+            task.deliveries = pullStore.deliveries(id);
+            task.notifications = pullStore.notifications(id);
+            Map<String, Object> progress = pullStore.progress(id);
+            if (record.pullScanComplete && task.deliveries.stream().allMatch(u -> u.get("transfer_id") != null)) {
+                task.totalFiles = ((Number) progress.get("total_files")).longValue();
+                task.totalBytes = ((Number) progress.get("total_bytes")).longValue();
+            }
+            task.verifiedFiles = ((Number) progress.get("verified_files")).longValue();
+            task.verifiedBytes = ((Number) progress.get("verified_bytes")).longValue();
+            task.downloadedBytes = ((Number) progress.get("downloaded_bytes")).longValue();
+        }
         if (record.pushManifestSha256 != null) {
             Map<String, Object> progress = db.pushProgress(id);
             task.totalFiles = ((Number) progress.get("total_files")).longValue();
             task.totalBytes = ((Number) progress.get("total_bytes")).longValue();
             task.uploadedBytes = ((Number) progress.get("uploaded_bytes")).longValue();
+            task.uploadTrafficBytes = ((Number) progress.get("upload_traffic_bytes")).longValue();
+            task.readbackBytes = ((Number) progress.get("readback_bytes")).longValue();
+            task.retransmittedBytes = ((Number) progress.get("retransmitted_bytes")).longValue();
             task.verifiedFiles = ((Number) progress.get("verified_files")).longValue();
             task.verifiedBytes = ((Number) progress.get("verified_bytes")).longValue();
         }
@@ -274,6 +319,14 @@ public class TaskService {
         Task task = get(caller, id);
         if (page < 0 || size < 1 || size > 100) throw invalid();
         boolean frozen = task.totalFiles != null;
+        if (task.direction.equals("PULL")) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("taskRecordId", id); result.put("page", page); result.put("size", size);
+            result.put("manifestFrozen", frozen); result.put("totalFilesKnown", frozen);
+            if (frozen) result.put("totalFiles", task.totalFiles);
+            result.put("files", pullStore.files(id, size, (long) page * size));
+            return result;
+        }
         if (!frozen) return Map.of("taskRecordId", id, "page", page, "size", size, "manifestFrozen", false,
                 "totalFilesKnown", false, "files", List.of());
         long count = db.fileCount(id);
@@ -289,9 +342,12 @@ public class TaskService {
         Task t = new Task(); t.taskRecordId = row.id; t.callerId = row.callerId;
         t.taskId = row.externalTaskId; t.entryType = row.entryType; t.direction = row.direction;
         t.endpointId = row.endpointId; t.endpointRevisionId = row.endpointRevisionId;
+        t.claimId = row.claimId;
         t.canonicalRequest = row.canonicalRequest; t.executionStatus = row.status; t.phase = row.phase;
         t.acceptanceStatus = row.acceptanceStatus; t.errorType = row.errorType;
         t.errorDetail = row.errorDetail; t.createdAt = row.createdAt; t.updatedAt = row.updatedAt;
+        if (row.pushRouteSnapshot != null) try { t.routeVersion = json.readTree(row.pushRouteSnapshot).path("version").asText(); }
+        catch (com.fasterxml.jackson.core.JsonProcessingException error) { throw new IllegalStateException("INVALID_ROUTE_SNAPSHOT", error); }
         return t;
     }
 

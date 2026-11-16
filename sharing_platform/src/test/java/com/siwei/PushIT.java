@@ -19,7 +19,6 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -77,6 +76,7 @@ class PushIT {
     @Autowired EndpointService endpoints;
     @Autowired EndpointRevisionRepository revisions;
     @Autowired PushProcessor push;
+    // Independent SQL is retained for scheduler/ACK fault injection and database assertions.
     @Autowired JdbcTemplate db;
     @Autowired TaskService tasks;
     @Autowired TaskWorker worker;
@@ -84,7 +84,9 @@ class PushIT {
     @Autowired TransferSettings transferSettings;
     @Autowired RemoteFileClientFactory clients;
     @Autowired ObjectMapper json;
-    @Autowired PlatformTransactionManager transactionManager;
+    @Autowired PushStore store;
+    @Autowired TransferTaskRepository taskRecords;
+    @Autowired TransferFileRepository fileRecords;
     @TempDir Path remoteRoot;
 
     @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
@@ -230,7 +232,7 @@ class PushIT {
                             } catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
                         });
             });
-            PushProcessor interrupted = new PushProcessor(db, json, revisions, transferSettings, faulty, transactionManager);
+            PushProcessor interrupted = new PushProcessor(store, json, revisions, transferSettings, faulty);
             assertThatThrownBy(() -> interrupted.process(task)).isInstanceOf(java.io.IOException.class);
             Path delivered = remoteRoot.resolve("deliver/weather/" + task.taskRecordId);
             assertThat(Files.readString(delivered.resolve("_READY"))).contains("taskId=" + task.taskRecordId);
@@ -272,11 +274,15 @@ class PushIT {
                             } catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
                         });
             });
-            PushProcessor interrupted = new PushProcessor(db, json, revisions, transferSettings, faulty, transactionManager);
+            PushProcessor interrupted = new PushProcessor(store, json, revisions, transferSettings, faulty);
             assertThatThrownBy(() -> interrupted.process(task)).isInstanceOf(java.io.IOException.class);
             assertThat(push.process(task).status).isEqualTo("SUCCEEDED");
             Path delivered = remoteRoot.resolve("deliver/weather/" + task.taskRecordId);
             assertThat(Files.readString(delivered.resolve("p1/a.bin"))).isEqualTo("long enough to break midstream");
+            Task visible = tasks.get("test", task.taskRecordId);
+            assertThat(visible.uploadedBytes).isEqualTo(visible.totalBytes);
+            assertThat(visible.uploadTrafficBytes).isGreaterThan(visible.totalBytes);
+            assertThat(visible.retransmittedBytes).isEqualTo(4);
             assertThat(Files.exists(delivered.resolve("_READY"))).isTrue();
         }
     }
@@ -308,6 +314,7 @@ class PushIT {
             });
             Path deliveredFile = remoteRoot.resolve("deliver/weather/" + accepted.taskRecordId + "/p1/a.bin");
             var modified = Files.getLastModifiedTime(deliveredFile);
+            assertThat(tasks.get("push", accepted.taskRecordId).phase).isEqualTo("NOTIFYING");
             refuseCompleteAck.set(false);
             db.update("UPDATE transfer_notification SET next_attempt_at=now() WHERE task_id=? AND stage='COMPLETE'", accepted.taskRecordId);
             await(() -> {
@@ -316,6 +323,7 @@ class PushIT {
             });
             assertThat(Files.getLastModifiedTime(deliveredFile)).isEqualTo(modified);
             assertThat(tasks.get("push", accepted.taskRecordId).executionStatus).isEqualTo("SUCCEEDED");
+            assertThat(tasks.get("push", accepted.taskRecordId).phase).isEqualTo("COMPLETE");
             assertThat(tasks.get("push", accepted.taskRecordId).verifiedBytes).isEqualTo((long) "workflow payload".length());
             assertThat(Files.readString(remoteRoot.resolve("deliver/weather/" + accepted.taskRecordId + "/p1/a.bin"))).isEqualTo("workflow payload");
             assertThat(db.queryForObject("SELECT payload FROM transfer_notification WHERE task_id=? AND stage='COMPLETE'", String.class, accepted.taskRecordId))
@@ -345,6 +353,196 @@ class PushIT {
         }
     }
 
+    @Test void frozenFilesAndTaskSnapshotRollBackTogetherOnDatabaseFailure() throws Exception {
+        String name = "freeze-rollback-" + UUID.randomUUID(); Files.createDirectories(SOURCE.resolve(name + "/nested"));
+        Files.writeString(SOURCE.resolve(name + "/nested/a.bin"), "payload");
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+            String endpointId = endpoints.save(null, form);
+            Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
+            task.products = List.of(Map.of("product_id", "p1", "product_path", name));
+            db.execute("CREATE FUNCTION fail_push_freeze() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.task_id='" + task.taskRecordId + "' THEN RAISE EXCEPTION 'forced'; END IF; RETURN NEW; END $$");
+            db.execute("CREATE TRIGGER fail_push_freeze BEFORE INSERT ON transfer_file FOR EACH ROW EXECUTE FUNCTION fail_push_freeze()");
+            try {
+                assertThatThrownBy(() -> push.process(task)).isInstanceOf(RuntimeException.class);
+                assertThat(fileRecords.countByTaskId(task.taskRecordId)).isZero();
+                assertThat(store.directories(task.taskRecordId)).isEmpty();
+                assertThat(taskRecords.findById(task.taskRecordId).orElseThrow().pushManifestSha256).isNull();
+            } finally { db.execute("DROP TRIGGER fail_push_freeze ON transfer_file"); db.execute("DROP FUNCTION fail_push_freeze()"); }
+            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK");
+            assertThat(fileRecords.countByTaskId(task.taskRecordId)).isEqualTo(1);
+        }
+    }
+
+    @Test void confirmedPublicationRecoversEvenAfterLocalSourceRootIsRemoved() throws Exception {
+        Path isolated = Files.createDirectory(SOURCE.resolve("published-" + UUID.randomUUID()));
+        Path product = Files.createDirectory(isolated.resolve("product")); Files.writeString(product.resolve("a.bin"), "fixed");
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+            String endpointId = endpoints.save(null, form);
+            Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
+            TransferTaskRecord record = taskRecords.findById(task.taskRecordId).orElseThrow();
+            record.pushSourceRoot = isolated.toRealPath().toString(); taskRecords.saveAndFlush(record);
+            task.products = List.of(Map.of("product_id", "p1", "product_path", "product"));
+            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK"); task.phase = "PRECHECK_ACKED";
+            assertThat(push.process(task).status).isEqualTo("SUCCEEDED");
+            Files.delete(product.resolve("a.bin")); Files.delete(product); Files.delete(isolated);
+            assertThat(push.process(task).status).isEqualTo("SUCCEEDED");
+        }
+    }
+
+    @Test void uploadAndReadbackCheckpointsAreVisibleBeforeTheFileFinishes() throws Exception {
+        String sourceName = "progress-" + UUID.randomUUID();
+        Files.createDirectories(SOURCE.resolve(sourceName));
+        Files.write(SOURCE.resolve(sourceName + "/large.bin"), new byte[10 * 1024 * 1024]);
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+            String endpointId = endpoints.save(null, form);
+            Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
+            task.products = List.of(Map.of("product_id", "p1", "product_path", sourceName));
+            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK"); task.phase = "PRECHECK_ACKED";
+            AtomicBoolean uploaded = new AtomicBoolean(), readback = new AtomicBoolean();
+            RemoteFileClientFactory observed = mock(RemoteFileClientFactory.class);
+            when(observed.connect(any(EndpointRevision.class))).thenAnswer(invocation -> {
+                RemoteFileClient real = clients.connect(invocation.getArgument(0));
+                return java.lang.reflect.Proxy.newProxyInstance(RemoteFileClient.class.getClassLoader(), new Class<?>[] {RemoteFileClient.class},
+                        (proxy, method, arguments) -> {
+                    try {
+                        if (method.getName().equals("write") && ((String) arguments[0]).contains(".sharing-file-")) {
+                            arguments[1] = new java.io.FilterInputStream((java.io.InputStream) arguments[1]) {
+                                long count;
+                                @Override public int read(byte[] bytes, int offset, int length) throws java.io.IOException {
+                                    if (count >= 8 * 1024 * 1024 && uploaded.compareAndSet(false, true)) {
+                                        Task visible = tasks.get("test", task.taskRecordId);
+                                        assertThat(visible.uploadedBytes).isPositive().isLessThan(visible.totalBytes);
+                                        assertThat(visible.phase).isEqualTo("TRANSFERRING"); assertThat(visible.verifiedBytes).isZero();
+                                    }
+                                    int n = in.read(bytes, offset, length); if (n > 0) count += n; return n;
+                                }
+                            };
+                        }
+                        if (method.getName().equals("read") && ((String) arguments[0]).contains(".sharing-file-")) {
+                            arguments[1] = new java.io.FilterOutputStream((java.io.OutputStream) arguments[1]) {
+                                long count;
+                                @Override public void write(byte[] bytes, int offset, int length) throws java.io.IOException {
+                                    out.write(bytes, offset, length); count += length;
+                                    if (count >= 8 * 1024 * 1024 && readback.compareAndSet(false, true)) {
+                                        Task visible = tasks.get("test", task.taskRecordId);
+                                        assertThat(visible.readbackBytes).isPositive(); assertThat(visible.uploadedBytes).isEqualTo(visible.totalBytes);
+                                        assertThat(visible.phase).isEqualTo("VERIFYING"); assertThat(visible.executionStatus).isEqualTo("RUNNING");
+                                    }
+                                }
+                            };
+                        }
+                        return method.invoke(real, arguments);
+                    } catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                });
+            });
+            assertThat(new PushProcessor(store, json, revisions, transferSettings, observed).process(task).status).isEqualTo("SUCCEEDED");
+            Task visible = tasks.get("test", task.taskRecordId);
+            assertThat(uploaded).isTrue(); assertThat(readback).isTrue();
+            assertThat(visible.uploadedBytes).isEqualTo(visible.totalBytes);
+            assertThat(visible.uploadTrafficBytes).isEqualTo(visible.totalBytes);
+            assertThat(visible.verifiedBytes).isEqualTo(visible.totalBytes);
+            assertThat(visible.retransmittedBytes).isZero();
+            assertThat(visible.readbackBytes).isGreaterThanOrEqualTo(visible.totalBytes);
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"FTP,ready,false", "FTP,ready,true", "FTP,manifest,false", "FTP,manifest,true", "SFTP,ready,false", "SFTP,ready,true", "SFTP,manifest,false", "SFTP,manifest,true"})
+    void interruptedControlFilesRecoverWithoutReupload(EndpointRevision.Protocol protocol, String control, boolean partial) throws Exception {
+        String sourceName = "control-" + UUID.randomUUID();
+        Files.createDirectories(SOURCE.resolve(sourceName));
+        Files.writeString(SOURCE.resolve(sourceName + "/a.bin"), "fixed content");
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(protocol); form.localSourceRef = "source";
+            String endpointId = endpoints.save(null, form);
+            Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
+            task.products = List.of(Map.of("product_id", "p1", "product_path", sourceName));
+            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK"); task.phase = "PRECHECK_ACKED";
+            RemoteFileClientFactory faulty = mock(RemoteFileClientFactory.class);
+            when(faulty.connect(any(EndpointRevision.class))).thenAnswer(invocation -> {
+                RemoteFileClient real = clients.connect(invocation.getArgument(0));
+                return java.lang.reflect.Proxy.newProxyInstance(RemoteFileClient.class.getClassLoader(),
+                        new Class<?>[] {RemoteFileClient.class}, (proxy, method, arguments) -> {
+                            try {
+                                if (method.getName().equals("write") && ((String) arguments[0]).contains("/.sharing-" + control + "-")) {
+                                    byte[] bytes = ((java.io.InputStream) arguments[1]).readAllBytes();
+                                    real.write((String) arguments[0], new java.io.ByteArrayInputStream(partial ? Arrays.copyOf(bytes, bytes.length / 2) : bytes));
+                                    real.close(); throw new java.io.IOException("INTERRUPTED_CONTROL_WRITE");
+                                }
+                                return method.invoke(real, arguments);
+                            } catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                        });
+            });
+            PushProcessor interrupted = new PushProcessor(store, json, revisions, transferSettings, faulty);
+            assertThatThrownBy(() -> interrupted.process(task)).isInstanceOf(java.io.IOException.class);
+            Path delivered = remoteRoot.resolve("deliver/weather/" + task.taskRecordId);
+            Path temporary = delivered.resolve(".sharing-" + control + "-" + task.taskRecordId);
+            assertThat(Files.exists(temporary)).isTrue();
+            var modified = Files.getLastModifiedTime(delivered.resolve("p1/a.bin"));
+            assertThat(push.process(task).status).isEqualTo("SUCCEEDED");
+            assertThat(Files.exists(temporary)).isFalse();
+            assertThat(Files.getLastModifiedTime(delivered.resolve("p1/a.bin"))).isEqualTo(modified);
+            assertThat(Files.readString(delivered.resolve("_manifest.xml"))).isEqualTo(taskRecords.findById(task.taskRecordId).orElseThrow().pushManifest);
+        }
+    }
+
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings = {"other-task", "own-wrong-content", "own-no-intent"})
+    void unownedTemporaryFilesStillBlockPublication(String mode) throws Exception {
+        String name = "foreign-" + UUID.randomUUID();
+        Files.createDirectories(SOURCE.resolve(name)); Files.writeString(SOURCE.resolve(name + "/a.bin"), "payload");
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+            String endpointId = endpoints.save(null, form);
+            Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
+            task.products = List.of(Map.of("product_id", "p1", "product_path", name));
+            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK"); task.phase = "PRECHECK_ACKED";
+            Path delivered = remoteRoot.resolve("deliver/weather/" + task.taskRecordId); Files.createDirectories(delivered);
+            String owner = mode.equals("other-task") ? UUID.randomUUID().toString() : task.taskRecordId;
+            Path temporary = delivered.resolve(".sharing-manifest-" + owner); Files.writeString(temporary, "foreign");
+            if (mode.equals("own-wrong-content")) store.manifestIntent(task);
+            assertThatThrownBy(() -> push.process(task)).isInstanceOf(java.io.IOException.class);
+            assertThat(Files.readString(temporary)).isEqualTo("foreign");
+            assertThat(Files.exists(delivered.resolve("_READY"))).isFalse();
+        }
+    }
+
+    @Test void databaseCollationCannotChangeFrozenManifestAndLateClaimsCannotChangeProgress() throws Exception {
+        String name = "sort-" + UUID.randomUUID(); Path product = SOURCE.resolve(name); Files.createDirectories(product);
+        for (String path : List.of("Z.bin", "a.bin", "10.bin", "2.bin", "中文/层/a.bin", "é.bin", "😀.bin", "中.bin")) {
+            Path file = product.resolve(path); Files.createDirectories(file.getParent()); Files.writeString(file, "same length payload");
+        }
+        // Independent SQL assertion proves the test actually exercises different PostgreSQL sort orders.
+        List<String> localeOrder = db.queryForList("SELECT name FROM (VALUES ('Z.bin'),('a.bin')) v(name) ORDER BY name COLLATE \"default\"", String.class);
+        List<String> cOrder = db.queryForList("SELECT name FROM (VALUES ('Z.bin'),('a.bin')) v(name) ORDER BY name COLLATE \"C\"", String.class);
+        if (localeOrder.equals(cOrder)) {
+            List<String> collations = db.queryForList("SELECT collname FROM pg_collation WHERE (collname LIKE 'en_US%' OR collname LIKE 'en-US%' OR collname LIKE 'English_United States%') AND collname NOT ILIKE '%posix%' ORDER BY collname", String.class);
+            assertThat(collations).as("An English PostgreSQL collation is required for this regression").isNotEmpty();
+            String collation = collations.get(0).replace("\"", "\"\"");
+            localeOrder = db.queryForList("SELECT name FROM (VALUES ('Z.bin'),('a.bin')) v(name) ORDER BY name COLLATE \"" + collation + "\"", String.class);
+        }
+        assertThat(localeOrder).isNotEqualTo(cOrder);
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+            String endpointId = endpoints.save(null, form);
+            Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
+            task.products = List.of(Map.of("product_id", "p1", "product_path", name));
+            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK"); task.phase = "PRECHECK_ACKED";
+            String frozen = taskRecords.findById(task.taskRecordId).orElseThrow().pushManifest;
+            assertThat(push.process(task).status).isEqualTo("SUCCEEDED");
+            assertThat(Files.readString(remoteRoot.resolve("deliver/weather/" + task.taskRecordId + "/_manifest.xml"))).isEqualTo(frozen);
+            Task stale = task;
+            TransferTaskRecord record = taskRecords.findById(task.taskRecordId).orElseThrow(); record.claimId = UUID.randomUUID().toString(); taskRecords.saveAndFlush(record);
+            TransferFileRecord file = store.files(task.taskRecordId).get(0); long before = file.readbackBytes;
+            assertThatThrownBy(() -> store.progress(stale, file, 999, 999, 999, true)).hasMessage("EXECUTION_CLAIM_LOST");
+            assertThatThrownBy(() -> store.phase(stale, "PUBLISHING")).hasMessage("EXECUTION_CLAIM_LOST");
+            assertThatThrownBy(() -> store.publishIntent(stale)).hasMessage("EXECUTION_CLAIM_LOST");
+            assertThat(store.files(task.taskRecordId).get(0).readbackBytes).isEqualTo(before);
+        }
+    }
+
     private static void await(java.util.concurrent.Callable<Boolean> condition) throws Exception {
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(20);
         while (System.nanoTime() < deadline) {
@@ -363,9 +561,16 @@ class PushIT {
                 .put("sourceCode", "weather").toString();
         task.products = List.of(Map.of("product_id", "p1", "product_path", "one"),
                 Map.of("product_id", "p2", "product_path", "two"));
-        db.update("INSERT INTO transfer_task (id,caller_id,external_task_id,entry_type,direction,endpoint_id,endpoint_revision_id,notification_url,canonical_request,raw_request,push_source_root,status,phase,next_run_at,claimed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'http://127.0.0.1/notify',?,?,?,'RUNNING','ACCEPTED',now(),now(),now(),now())",
-                task.taskRecordId, task.callerId, task.taskId, task.entryType, task.direction, task.endpointId,
-                task.endpointRevisionId, task.canonicalRequest, task.canonicalRequest, SOURCE.toRealPath().toString());
+        task.claimId = UUID.randomUUID().toString();
+        TransferTaskRecord record = new TransferTaskRecord();
+        record.id = task.taskRecordId; record.callerId = task.callerId; record.externalTaskId = task.taskId;
+        record.entryType = task.entryType; record.direction = task.direction; record.endpointId = task.endpointId;
+        record.endpointRevisionId = task.endpointRevisionId; record.notificationUrl = "http://127.0.0.1/notify";
+        record.canonicalRequest = task.canonicalRequest; record.rawRequest = task.canonicalRequest;
+        record.pushSourceRoot = SOURCE.toRealPath().toString(); record.status = "RUNNING"; record.phase = "ACCEPTED";
+        record.claimId = task.claimId; record.acceptanceStatus = "NOT_STARTED";
+        record.nextRunAt = record.claimedAt = record.createdAt = record.updatedAt = java.time.Instant.now();
+        taskRecords.saveAndFlush(record);
         return task;
     }
 

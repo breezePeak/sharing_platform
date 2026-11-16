@@ -10,8 +10,16 @@ import org.springframework.transaction.annotation.Transactional;
 @Transactional
 public class TransferJpa {
     @PersistenceContext private EntityManager entityManager;
+    private final com.siwei.endpoint.EndpointCapacity capacity;
+    private final TransferFileRepository files;
+    public TransferJpa(com.siwei.endpoint.EndpointCapacity capacity, TransferFileRepository files) { this.capacity = capacity; this.files = files; }
 
-    private int update(String sql, Object... values) { return bind(entityManager.createNativeQuery(sql), values).executeUpdate(); }
+    private int update(String sql, Object... values) {
+        entityManager.flush();
+        int count = bind(entityManager.createNativeQuery(sql), values).executeUpdate();
+        entityManager.clear();
+        return count;
+    }
 
     private List<Map<String, Object>> queryForList(String sql, Object... values) {
         List<Map<String, Object>> rows = new ArrayList<>();
@@ -36,11 +44,15 @@ public class TransferJpa {
                 id, caller, taskId, entry, direction, endpointId, revisionId, notificationUrl, canonical, raw, sourceRoot, now, now, now);
     }
 
-    public List<Map<String, Object>> dueTasks(int limit) {
-        return queryForList("SELECT id,direction FROM transfer_task WHERE (status IN ('QUEUED','RECONCILING') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes') ORDER BY next_run_at LIMIT ?", limit);
+    public List<Map<String, Object>> dueTasks(int limit, int offset) {
+        return queryForList("SELECT id,direction FROM transfer_task WHERE (status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes') ORDER BY next_run_at,id LIMIT ? OFFSET ?", limit, offset);
     }
     public int claimTask(String id, String claim) {
-        return update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() WHERE id=? AND ((status IN ('QUEUED','RECONCILING') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
+        List<Map<String, Object>> candidates = queryForList("SELECT t.endpoint_id,r.concurrency FROM transfer_task t JOIN endpoint_revision r ON r.id=t.endpoint_revision_id WHERE t.id=?", id);
+        if (candidates.isEmpty()) return 0;
+        Map<String, Object> task = candidates.get(0);
+        if (!capacity.available((String) task.get("endpoint_id"), ((Number) task.get("concurrency")).intValue(), id)) return 0;
+        return update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() WHERE id=? AND ((status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
     }
     public int releaseTaskClaim(String id, String claim) {
         return update("UPDATE transfer_task SET status='QUEUED',claim_id=NULL,claimed_at=NULL,attempts=attempts-1,next_run_at=now(),updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'", id, claim);
@@ -50,11 +62,12 @@ public class TransferJpa {
                 error, next, id, claim);
     }
     public int heartbeatTask(String id, String claim) {
+        update("UPDATE pull_transfer SET claimed_at=now() WHERE claim_id=? AND EXISTS (SELECT 1 FROM transfer_task WHERE id=? AND claim_id=? AND status='RUNNING')", claim, id, claim);
         return update("UPDATE transfer_task SET claimed_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'", id, claim);
     }
     public int finishTask(String id, String claim, TaskProcessor.Result result) {
-        return update("UPDATE transfer_task SET status=?,phase=?,error_type=?,error_detail=?,next_run_at=CASE WHEN ?='RECONCILING' THEN now()+interval '30 seconds' ELSE next_run_at END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
-                result.status, result.phase, result.errorType, result.errorDetail, result.status, id, claim);
+        return update("UPDATE transfer_task SET status=?,phase=CASE WHEN ?='COMPLETE' THEN 'NOTIFYING' ELSE ? END,error_type=?,error_detail=?,next_run_at=CASE WHEN ?='RECONCILING' THEN now()+interval '30 seconds' ELSE next_run_at END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
+                result.status, result.phase, result.phase, result.errorType, result.errorDetail, result.status, id, claim);
     }
     public int insertNotification(String id, String taskId, String stage, String result, String protocol,
                                   String recipient, String payload, String hash) {
@@ -68,7 +81,9 @@ public class TransferJpa {
         return update("UPDATE transfer_notification SET status='SENDING',claim_id=?,claimed_at=now(),attempts=attempts+1 WHERE id=? AND ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at<=now()) OR (status='SENDING' AND claimed_at<now()-interval '1 minute'))", claim, id);
     }
     public int ackNotification(String id, String claim, String ack) {
-        return update("UPDATE transfer_notification SET status='ACKED',ack=?,claim_id=NULL,claimed_at=NULL,last_error=NULL WHERE id=? AND claim_id=? AND status='SENDING'", ack, id, claim);
+        int count = update("UPDATE transfer_notification SET status='ACKED',ack=?,claim_id=NULL,claimed_at=NULL,last_error=NULL WHERE id=? AND claim_id=? AND status='SENDING'", ack, id, claim);
+        if (count == 1) update("UPDATE transfer_task SET phase='COMPLETE',updated_at=now() WHERE phase='NOTIFYING' AND id IN (SELECT task_id FROM transfer_notification WHERE id=? AND stage='COMPLETE' AND status='ACKED')", id);
+        return count;
     }
     public int resumeAfterPrecheck(String taskId, String notificationId) {
         return update("UPDATE transfer_task SET status='QUEUED',phase='PRECHECK_ACKED',attempts=0,next_run_at=now(),version=version+1,updated_at=now() WHERE id=? AND status='WAITING_FEEDBACK' AND EXISTS (SELECT 1 FROM transfer_notification WHERE id=? AND stage='PRECHECK' AND result_status='WAITING_FEEDBACK')", taskId, notificationId);
@@ -78,12 +93,15 @@ public class TransferJpa {
                 status, next, error, id, claim);
     }
     public Map<String, Object> pushProgress(String taskId) {
-        return queryForList("SELECT count(*) AS total_files,coalesce(sum(size_bytes),0) AS total_bytes,coalesce(sum(uploaded_bytes),0) AS uploaded_bytes,count(*) FILTER (WHERE verified) AS verified_files,coalesce(sum(size_bytes) FILTER (WHERE verified),0) AS verified_bytes FROM transfer_file WHERE task_id=?", taskId).get(0);
+        return queryForList("SELECT count(*) AS total_files,coalesce(sum(size_bytes),0) AS total_bytes,coalesce(sum(uploaded_bytes),0) AS uploaded_bytes,coalesce(sum(upload_traffic_bytes),0) AS upload_traffic_bytes,coalesce(sum(readback_bytes),0) AS readback_bytes,coalesce(sum(greatest(upload_traffic_bytes-uploaded_bytes,0)),0) AS retransmitted_bytes,count(*) FILTER (WHERE verified) AS verified_files,coalesce(sum(size_bytes) FILTER (WHERE verified),0) AS verified_bytes FROM transfer_file WHERE task_id=?", taskId).get(0);
     }
     public long fileCount(String taskId) {
-        return ((Number) bind(entityManager.createNativeQuery("SELECT count(*) FROM transfer_file WHERE task_id=?"), new Object[] {taskId}).getSingleResult()).longValue();
+        return files.countByTaskId(taskId);
     }
     public List<Map<String, Object>> filePage(String taskId, int size, long offset) {
-        return queryForList("SELECT product_id,relative_path,size_bytes,sha256,verified FROM transfer_file WHERE task_id=? ORDER BY product_id,relative_path LIMIT ? OFFSET ?", taskId, size, offset);
+        List<Map<String, Object>> rows = new ArrayList<>();
+        files.findByTaskId(taskId).stream().sorted(TransferFileRecord.ORDER).skip(offset).limit(size).forEach(file ->
+                rows.add(Map.of("product_id", file.product, "relative_path", file.path, "size_bytes", file.size, "sha256", file.sha, "verified", file.verified)));
+        return rows;
     }
 }

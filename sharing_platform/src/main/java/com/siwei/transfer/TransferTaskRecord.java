@@ -20,6 +20,11 @@ public class TransferTaskRecord {
     @Column(name = "push_source_root") public String pushSourceRoot;
     @Column(name = "push_target_root") public String pushTargetRoot;
     @Column(name = "push_publish_intent") public boolean pushPublishIntent;
+    @Column(name = "push_manifest_intent") public boolean pushManifestIntent;
+    @Column(name = "push_manifest") public String pushManifest;
+    @Column(name = "push_route_snapshot") public String pushRouteSnapshot;
+    @Column(name = "pull_config") public String pullConfig;
+    @Column(name = "pull_scan_complete") public boolean pullScanComplete;
     public String status, phase;
     @Column(name = "acceptance_status") public String acceptanceStatus;
     @Column(name = "error_type") public String errorType;

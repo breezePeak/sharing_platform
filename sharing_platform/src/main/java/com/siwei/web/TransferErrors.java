@@ -7,7 +7,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
 @Order(org.springframework.core.Ordered.HIGHEST_PRECEDENCE)
-@RestControllerAdvice(assignableTypes = TransferController.class)
+@RestControllerAdvice(assignableTypes = {TransferController.class, PullConfirmationController.class})
 public class TransferErrors {
     @ExceptionHandler(ResponseStatusException.class)
     ResponseEntity<Map<String, String>> known(ResponseStatusException error) {

@@ -40,12 +40,11 @@ public class ProbeRunner {
         try {
             workers.execute(() -> {
                 ScheduledFuture<?> deadline = timer.schedule(() -> {
-                    try { store.stop(p.id, "TIMED_OUT"); }
-                    finally {
+                    try {
                         cancelled.set(true);
                         RemoteFileClient client = active.get();
                         if (client != null) try { client.close(); } catch (IOException ignored) { /* residuals are persisted before writes */ }
-                    }
+                    } finally { store.stop(p.id, "TIMED_OUT"); }
                 }, r.timeoutSeconds * 6L, TimeUnit.SECONDS);
                 try { run(p, r, active, cancelled); }
                 finally { deadline.cancel(false); }
@@ -64,9 +63,11 @@ public class ProbeRunner {
         })) {
             if (cancelled.get()) throw new Stopped();
             new Execution(p, r, client).probe();
+            if (cancelled.get()) return;
             p.status = "COMPLETED";
         } catch (Stopped e) { return;
         } catch (IOException | RuntimeException e) {
+            if (cancelled.get()) return;
             p.status = "FAILED"; p.details += "\nCONNECT_OR_SESSION: " + reason(e);
         } finally { active.set(null); }
         store.finish(p);

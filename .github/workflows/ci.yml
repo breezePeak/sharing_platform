@@ -47,7 +47,7 @@ jobs:
           "$RUNNER_TEMP/pgsql/bin/pg_ctl" -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/postgres.log" -o "-h 127.0.0.1 -p $PGPORT" -w start
           "$RUNNER_TEMP/pgsql/bin/createdb" sharing_platform_test
       - name: Compile, unit test, package and run real database integration tests
-        run: sh ./mvnw -B clean verify
+        run: ./mvnw -B clean verify
       - name: Stop test database
         if: always()
         run: |

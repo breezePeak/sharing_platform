@@ -10,6 +10,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class FoundationTest {
+    @Test void consoleLayoutMasksBearerAndSecretsContainingSpaces() throws Exception {
+        var context = new ch.qos.logback.classic.LoggerContext();
+        try (var input = getClass().getResourceAsStream("/logback-spring.xml")) {
+            var config = javax.xml.parsers.DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(input);
+            var layout = new ch.qos.logback.classic.PatternLayout(); layout.setContext(context);
+            layout.setPattern(config.getElementsByTagName("pattern").item(0).getTextContent()); layout.start();
+            for (String message : new String[] {"Authorization: Bearer canary token with spaces", "password=canary secret, rest; more", "secret: \"canary spaced value\""}) {
+                var event = new ch.qos.logback.classic.spi.LoggingEvent("test", context.getLogger("test"), ch.qos.logback.classic.Level.INFO, message, null, null);
+                assertThat(layout.doLayout(event)).contains("[REDACTED]").doesNotContain("canary", "spaced value", "rest");
+            }
+        } finally { context.stop(); }
+    }
+
     @Test
     void databaseTestsRejectUnspecifiedOrUnsafeTargets() {
         for (String url : new String[] {"", "jdbc:h2:mem:test", "jdbc:postgresql://localhost/postgres",

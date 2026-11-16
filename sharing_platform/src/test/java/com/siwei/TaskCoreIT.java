@@ -101,6 +101,7 @@ class TaskCoreIT {
         p.add("platform.transfers.callers.test.xml-routes.weather", () -> ENDPOINT);
         p.add("platform.transfers.callers.outsider.token", () -> "other-secret");
         p.add("platform.transfers.callers.outsider.endpoint-ids[0]", () -> OUTSIDER_ENDPOINT);
+        p.add("platform.endpoints.master-key", () -> Base64.getEncoder().encodeToString(new byte[32]));
         p.add("platform.transfers.provisional-xml-enabled", () -> true);
         p.add("platform.transfers.push-enabled", () -> false);
         p.add("platform.endpoints.local-roots.local", () -> System.getProperty("java.io.tmpdir"));
@@ -109,16 +110,25 @@ class TaskCoreIT {
     @TestConfiguration static class ProcessorConfig {
         @Bean @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
                 name = "platform.transfers.push-enabled", havingValue = "false")
-        TaskProcessor testProcessor() {
+        TaskProcessor testProcessor(com.siwei.protocol.RemoteFileClientFactory clients, com.siwei.endpoint.EndpointRevisionRepository revisions) {
             return new TaskProcessor() {
                 public String direction() { return "PUSH"; }
-                public Result process(Task task) {
+                public Result process(Task task) throws Exception {
                     executionsByTask.computeIfAbsent(task.taskId, ignored -> new AtomicInteger()).incrementAndGet();
                     if (task.taskId.startsWith("block-") || task.taskId.equals("stale") || task.taskId.equals("late-claim")) {
                         blockedStarted.incrementAndGet();
                         try { blockRelease.await(15, TimeUnit.SECONDS); }
                         catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException(e); }
                     }
+                    if (task.taskId.equals("stall-real")) {
+                        try (var client = clients.connect(revisions.findById(task.endpointRevisionId).orElseThrow())) {
+                            client.write("/large.bin", new java.io.InputStream() {
+                                @Override public int read() { return 1; }
+                                @Override public int read(byte[] bytes, int offset, int length) { return length; }
+                            });
+                        }
+                    }
+                    if (task.taskId.equals("capacity-failure")) throw new IllegalStateException("INJECTED_FAILURE");
                     if ((task.taskId.equals("precheck") || task.taskId.equals("ack-rollback")) && task.phase.equals("ACCEPTED"))
                         return new Result("WAITING_FEEDBACK", "PRECHECK", null, null);
                     return new Result("SUCCEEDED", "COMPLETE", null, null);
@@ -139,7 +149,7 @@ class TaskCoreIT {
     @BeforeEach void endpoint() {
         db.update("INSERT INTO endpoint (id,revision,enabled) VALUES (?,1,true) ON CONFLICT (id) DO NOTHING", ENDPOINT);
         db.update("UPDATE endpoint SET revision=1 WHERE id=?", ENDPOINT);
-        db.update("INSERT INTO endpoint_revision (id,endpoint_id,revision,name,protocol,host,port,username,auth,read_root,write_root,local_source_ref,local_target_ref,timeout_seconds,concurrency,passive,isolated_ftp_root,created_at) VALUES (?,?,1,'test','FTP','127.0.0.1',21,'test','PASSWORD','/in','/out','local','local',5,1,true,true,now()) ON CONFLICT (endpoint_id,revision) DO NOTHING",
+        db.update("INSERT INTO endpoint_revision (id,endpoint_id,revision,name,protocol,host,port,username,auth,read_root,write_root,local_source_ref,local_target_ref,timeout_seconds,concurrency,passive,isolated_ftp_root,created_at) VALUES (?,?,1,'test','FTP','127.0.0.1',21,'test','PASSWORD','/in','/out','local','local',5,2,true,true,now()) ON CONFLICT (endpoint_id,revision) DO NOTHING",
                 UUID.randomUUID().toString(), ENDPOINT);
     }
 
@@ -469,6 +479,97 @@ class TaskCoreIT {
             assertThat(blockedStarted.get()).isEqualTo(1);
             assertThat(db.queryForObject("SELECT attempts FROM transfer_task WHERE id=?", Integer.class, first.taskRecordId)).isEqualTo(1);
         } finally { blockRelease.countDown(); }
+    }
+
+    @Autowired com.siwei.endpoint.EndpointRepository endpointRecords;
+    @Autowired com.siwei.endpoint.EndpointRevisionRepository endpointRevisions;
+    @Autowired com.siwei.endpoint.ProbeStore probeStore;
+
+    private String capacityEndpoint() {
+        var endpoint = new com.siwei.endpoint.Endpoint(); endpoint.id = UUID.randomUUID().toString(); endpoint.revision = 1; endpoint.enabled = true;
+        endpointRecords.saveAndFlush(endpoint);
+        var r = new com.siwei.endpoint.EndpointRevision(); r.id = UUID.randomUUID().toString(); r.endpointId = endpoint.id;
+        r.revision = 1; r.name = "capacity"; r.protocol = com.siwei.endpoint.EndpointRevision.Protocol.FTP;
+        r.host = "127.0.0.1"; r.port = 21; r.username = "test"; r.auth = com.siwei.endpoint.EndpointRevision.Auth.PASSWORD;
+        r.writeRoot = "/out"; r.localSourceRef = "local"; r.timeoutSeconds = 1; r.concurrency = 1;
+        r.passive = r.isolatedFtpRoot = true; r.createdAt = java.time.Instant.now(); endpointRevisions.saveAndFlush(r);
+        transferSettings.getCallers().get("test").getEndpointIds().add(endpoint.id);
+        return endpoint.id;
+    }
+
+    @Test void endpointLimitQueuesTasksSharesProbeCapacityAndDoesNotBlockOtherEndpoints() throws Exception {
+        String endpoint = capacityEndpoint(), other = capacityEndpoint();
+        blockedStarted.set(0); blockRelease = new CountDownLatch(1);
+        String firstBody = request("block-capacity-1").replace(ENDPOINT, endpoint);
+        String secondBody = request("block-capacity-2").replace(ENDPOINT, endpoint);
+        var first = service.accept("test", service.parseJson(firstBody), firstBody, "JSON");
+        var second = service.accept("test", service.parseJson(secondBody), secondBody, "JSON");
+        try {
+            await(() -> blockedStarted.get() == 1);
+            assertThat(service.get("test", second.taskRecordId).executionStatus).isEqualTo("QUEUED");
+            assertThatThrownBy(() -> probeStore.create(endpoint, 1)).isInstanceOf(org.springframework.web.server.ResponseStatusException.class);
+            String body = request("capacity-other").replace(ENDPOINT, other);
+            var independent = service.accept("test", service.parseJson(body), body, "JSON");
+            await(() -> service.get("test", independent.taskRecordId).executionStatus.equals("SUCCEEDED"));
+            assertThat(blockedStarted.get()).isEqualTo(1);
+        } finally { blockRelease.countDown(); }
+        await(() -> service.get("test", first.taskRecordId).executionStatus.equals("SUCCEEDED")
+                && service.get("test", second.taskRecordId).executionStatus.equals("SUCCEEDED"));
+        var probe = probeStore.create(endpoint, 1);
+        try {
+            String failedBody = request("capacity-failure").replace(ENDPOINT, endpoint);
+            var failed = service.accept("test", service.parseJson(failedBody), failedBody, "JSON");
+            worker.poll(); assertThat(service.get("test", failed.taskRecordId).executionStatus).isEqualTo("QUEUED");
+            probeStore.stop(probe.id, "COMPLETED");
+            await(() -> service.get("test", failed.taskRecordId).executionStatus.equals("FAILED"));
+            String body = request("capacity-after-failure").replace(ENDPOINT, endpoint);
+            var after = service.accept("test", service.parseJson(body), body, "JSON");
+            await(() -> service.get("test", after.taskRecordId).executionStatus.equals("SUCCEEDED"));
+        } finally { probeStore.stop(probe.id, "COMPLETED"); }
+    }
+
+    @Autowired com.siwei.endpoint.EndpointService endpointService;
+    @Test void realStalledFtpReleasesTaskWorkerAndEndpointForQueuedWork() throws Exception {
+        try (StreamingFtpServer server = new StreamingFtpServer(StreamingFtpServer.Fault.STALLED_STOR)) {
+            var form = new com.siwei.endpoint.EndpointForm(); form.name = "real stall"; form.host = "127.0.0.1";
+            form.port = server.port(); form.username = "tester"; form.password = "test-only"; form.writeRoot = "/";
+            form.localSourceRef = "local"; form.isolatedFtpRoot = true; form.timeoutSeconds = 1;
+            String endpoint = endpointService.save(null, form);
+            transferSettings.getCallers().get("test").getEndpointIds().add(endpoint);
+            String body = request("stall-real").replace(ENDPOINT, endpoint);
+            var stalled = service.accept("test", service.parseJson(body), body, "JSON");
+            await(() -> server.started.get() == 1);
+            String next = request("after-real-stall").replace(ENDPOINT, endpoint);
+            var queued = service.accept("test", service.parseJson(next), next, "JSON");
+            worker.poll(); assertThat(service.get("test", queued.taskRecordId).executionStatus).isEqualTo("QUEUED");
+            await(() -> service.get("test", queued.taskRecordId).executionStatus.equals("SUCCEEDED"));
+            assertThat(server.stopped.get()).isEqualTo(1);
+            assertThat(service.get("test", stalled.taskRecordId).executionStatus).isEqualTo("QUEUED");
+            assertThat(db.queryForObject("SELECT attempts FROM transfer_task WHERE id=?", Integer.class, stalled.taskRecordId)).isEqualTo(1);
+            // Isolate the retry from later tests without changing its fixed request or endpoint snapshot.
+            db.update("UPDATE transfer_task SET next_run_at=now()+interval '1 day' WHERE id=?", stalled.taskRecordId);
+        }
+    }
+
+    @Test void versionedRouteFreezesPathsAndNotificationsAndReplaySurvivesDisable() throws Exception {
+        var caller = transferSettings.getCallers().get("test");
+        var route = new TransferSettings.Route(); route.setEndpointId(ENDPOINT); route.setSourceRoot("local");
+        route.setTargetRoot("output"); route.setVersion("r1"); route.setNotificationUrl(caller.getNotificationUrl());
+        caller.getRoutes().put("route-test", route);
+        try {
+            String body = request("route-snapshot").replace("\"sourceRoot\"", "\"sourceCode\":\"route-test\",\"sourceRoot\"");
+            var accepted = service.accept("test", service.parseJson(body), body, "JSON");
+            String frozen = db.queryForObject("SELECT push_route_snapshot FROM transfer_task WHERE id=?", String.class, accepted.taskRecordId);
+            assertThat(frozen).contains("\"version\":\"r1\"", "\"targetRoot\":\"/out/output\"");
+            route.setVersion("r2"); route.setEnabled(false); route.setNotificationUrl("https://different.example/notify");
+            assertThat(service.accept("test", service.parseJson(body), body, "JSON").reused).isTrue();
+            assertThat(db.queryForObject("SELECT push_route_snapshot FROM transfer_task WHERE id=?", String.class, accepted.taskRecordId)).isEqualTo(frozen);
+            String fresh = body.replace("route-snapshot", "route-disabled");
+            assertThatThrownBy(() -> service.accept("test", service.parseJson(fresh), fresh, "JSON")).hasMessageContaining("ROUTE_DISABLED");
+            route.setEnabled(true);
+            String outside = fresh.replace("output", "outside");
+            assertThatThrownBy(() -> service.accept("test", service.parseJson(outside), outside, "JSON")).hasMessageContaining("INVALID_TASK");
+        } finally { caller.getRoutes().remove("route-test"); }
     }
 
     @Test void wrongAckStopsAtConfiguredAttemptLimit() throws Exception {

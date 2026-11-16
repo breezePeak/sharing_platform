@@ -21,3 +21,13 @@
 远端 HEAD 只读核对为 `5b1213e805daedc3e25221b31beb6cbea89cdc17`，与本地起点一致。现有用户文档改动保留，四份基线版本为 V1.2/V1.1/V1.1/V1.2；SFTP、多监听、统一入口和回执未被回退。未实施 PR-02 及后续业务。
 
 JPA 实体及仓储遵循 [Spring Data JPA 2.7.18 官方文档](https://docs.spring.io/spring-data/jpa/docs/2.7.18/reference/html/)，不保留自写 JDBC 仓储或 Spring Security 包装层。
+
+
+## 2026-11-16 PR4 审查修复补充
+
+- PushProcessor 只编排流程，文件/目录使用复合键实体和 JpaRepository，PushStore 在短事务中锁任务并校验执行 claim；TransferJpa 保留必要原子原生语句，在更新前 flush、更新后 clear 防止上下文过期。生产代码不使用 JdbcTemplate。
+- 稳定 endpointId 的数据库行锁协调任务领取与探测创建；RUNNING 记录占名额，满额不领取、不占线程；并存配置修订采用请求和已有执行的最小并发限制。成功/失败前先关闭会话，再释放状态；探测超时也先关闭，取消结果不会覆盖终态。
+- 业务复用同一 FTP/SFTP 适配器和关闭路径，以修订中的 timeoutSeconds 限制网络无进展，连续传输可以长期运行；探测保留总时限。配置快照不增加一套超时配置。
+- 清单 v1 按 Java UTF-16 字典序排序，新记录保存精确清单文本；旧记录核对原摘要，不改数据库默认 collation、不重冻基准。V6 只新增字段和保守迁移 manifest 意图；V1—V4 不改写，当前工作区既有 V5 保留。
+- 仍使用外置 Spring YAML 提供 caller/type 完整路由，保留 xml-routes 与旧 JSON 兼容入口；受理时持久化路由版本、源/目标/通知/端点修订，重放优先比较旧快照。
+- wrapper Git 模式为 100755，Unix/CI 使用 `./mvnw -B clean verify`，Windows 使用 `.\mvnw.cmd -B clean verify`。本轮实测与边界见 [PR4 审查修复记录](pr/PR-04_审查修复记录.md)。

@@ -1,6 +1,6 @@
 # 数据共享平台
 
-工程位于 `sharing_platform/`。使用 **JDK 11 / Spring Boot 2.7.18、Spring Data JPA、直接连接 PostgreSQL、页面无需登录**，不引入 Spring Security。PR2 新增 FTP/SFTP 连接配置、版本化加密凭据和异步真实能力检测；PR3 新增任务接入骨架与通知队列；PR4 接入真实 PUSH。PULL 与监听仍未开放，未装配处理器的方向返回 503。
+工程位于 `sharing_platform/`。使用 **JDK 11 / Spring Boot 2.7.18、Spring Data JPA、直接连接 PostgreSQL、页面无需登录**，不引入 Spring Security。PR2 新增 FTP/SFTP 连接配置、版本化加密凭据和异步真实能力检测；PR3 新增任务接入骨架与通知队列；PR4 接入真实 PUSH；PR5 接入单次 PULL、版本去重和业务验收。周期监听尚未开放。
 
 ## 环境与数据库准备
 
@@ -31,13 +31,13 @@ $env:DB_PASSWORD = Read-Host '数据库密码' -MaskInput
 $env:TEST_DB_URL = 'jdbc:postgresql://127.0.0.1:5432/sharing_platform_test'
 $env:TEST_DB_USERNAME = 'postgres'
 $env:TEST_DB_PASSWORD = Read-Host '独立测试库密码' -MaskInput
-.\mvnw.cmd clean verify
+.\mvnw.cmd -B clean verify
 java -jar target/sharing_platform-1.0-SNAPSHOT.jar --spring.profiles.active=local
 ```
 
 本机开发可在仓库根目录执行 `. ./.env.local.ps1` 载入用户提供的数据库参数；该文件被 Git 忽略，不用于生产部署。
 
-Unix 使用 `sh ./mvnw clean verify`；环境变量含义相同。`package` 只执行单元/页面测试，完整验收必须使用 `verify`，其后运行真实数据库集成测试。数据库不可达、迁移冲突或缺少配置时启动失败，不回退到其他数据库。
+Unix 使用 `./mvnw -B clean verify`；环境变量含义相同。`package` 只执行单元/页面测试，完整验收必须使用 `verify`，其后运行真实数据库集成测试。数据库不可达、迁移冲突或缺少配置时启动失败，不回退到其他数据库。
 
 | 配置 | 用途 |
 | --- | --- |
@@ -79,9 +79,23 @@ PUSH 使用现有 Bearer 调用方、endpoint 授权和通知配置。连接须�
 
 默认拒绝零字节文件以及 `.tmp`、`.part`、`.crdownload` 文件；可在外置配置中使用 `platform.transfers.allow-zero-byte-files` 和 `platform.transfers.temporary-suffixes` 调整。生产方下发任务须代表其固定版本已就绪；无上游预期清单时，平台只能证明所观察集合固定，无法证明上游未漏生成文件。接收方按有效 `_READY` 和匹配的清单消费，需在联调中确认。关闭新 PUSH 受理可设置 `platform.transfers.push-intake-enabled=false`，处理器继续完成在途任务及通知，已发布数据保留；旧版本不能识别新状态时不可直接降级执行器。
 
+## PR5 单次拉取
+
+PULL 使用统一任务入口，必须引用管理员配置的稳定 `sourceId`，显式选择 FILE 或 PACKAGE_DIR、扫描层级、BASIC/HASH、就绪规则、交付根和业务访问映射。来源配置及 HASH 清单格式见 [任务接口契约](doc/contracts/transfer-api.md#pull-来源配置与源清单)。一次调用只处理本次范围，不创建永久监听；缺少就绪条件时由原任务的 `nextRunAt` 重查。
+
+数据在 `tmp/transferId/` 下载、校验后发布到 `pending/transferId/`；接收端只消费含有效 `.sharing-complete` 的目录。通知给出配置映射下的 `dataLocation`，需由部署方配置共享挂载或读取服务并验证业务平台确实可访问；应用不会自动暴露本机目录。下载完成后保持待验收，认证接收方调用 `POST /api/sharing/pull/confirmations` 后才决定最终结果；验收先于通知 ACK 也有效。原数据与已发布目录默认保留。
+
+新增生产迁移 `V5__pull_deliveries.sql`；已执行 V1—V4 不改写。工作区并行的 PUSH 修复使用 V6，升级测试专用迁移顺延至 V7，不进入应用 JAR。关闭新拉取设置 `platform.pulls.intake-enabled=false`，保留处理器、查询、通知及回执；不要用 `platform.pulls.enabled=false` 回退在途交付。实现与验收证据见 [PR5 实施记录](doc/pr/PR-05_实施记录.md)。
+
+PR4 审查修复后，连接的 `timeoutSeconds` 同时作为业务网络 I/O 无进展期限（1—30 秒）：上传/回读有字节进展便续期，持续传输不受固定总时长限制；过期直接关闭底层会话，进入原文件的有限重试。探测保留原总时限。`concurrency` 由稳定 endpointId 统一约束业务执行与探测，跨配置修订共享名额；并存修订采用较小限制。在途任务使用原配置，停用不切换地址或凭据；满额任务留库排队，不占 worker。不同端点可利用空闲 worker。
+
+查询新增 `uploadTrafficBytes`、`readbackBytes`、`retransmittedBytes` 和 `routeVersion`；上传业务完成量按文件高水位计数，已验证量独立记录，网络流量含重试及重复核验。流内每 8 MiB 或 1 秒节流落库，文件结束/异常刷新。`SUCCEEDED` 表示技术发布已确认；完成通知未 ACK 时阶段 `NOTIFYING`，ACK 后为 `COMPLETE`，不因补通知重传文件。版本化 `callerId/type → endpoint` 路由沿用外置 YAML，见[接口契约](doc/contracts/transfer-api.md)。
+
+V6 新增精确清单字节、manifest 发布意图、路由快照和流量列。保留当前工作区既有 V5（PULL）及 V1—V4 原迁移，不清空业务表。历史 V4 清单按 Java UTF-16 字符串顺序恢复并核对原摘要；不修改数据库 collation、不重新冻结源内容。已确认归属的 manifest/READY 临时文件在严格集合检查前核对、清理并重写，其他任务或内容不符的临时文件仍阻止发布。发布不明继续 `RECONCILING`，不提前发失败完成单。详细改动与本轮真实测试见[审查修复记录](doc/pr/PR-04_审查修复记录.md)。
+
 ## 测试、迁移与回退
 
-纯单元/页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`，不需要数据库。`./mvnw clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`；默认 URL 数据库名须以 `_test` 结尾，禁止 URL 内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权在本机应用库验收时，额外设置 `TEST_DB_ALLOW_LOCAL=true`，才允许回环地址上与 `DB_URL` 相同的非系统数据库。每次测试创建随机 `foundation_it_*` / `endpoint_it_*` / `task_it_*` / `push_it_*` schema，只删除本次随机 schema，不清空数据库或修改现有业务 schema。真实协议服务仅监听回环地址，使用临时目录和测试凭据。测试覆盖 V1→V4 增量迁移、JPA、重启保留、测试专用 V5 升级、页面防伪、双协议能力、任务幂等、领取、通知补发及故障回滚等。
+纯单元/页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`，不需要数据库。`./mvnw -B clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`；默认 URL 数据库名须以 `_test` 结尾，禁止 URL 内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权在本机应用库验收时，额外设置 `TEST_DB_ALLOW_LOCAL=true`，才允许回环地址上与 `DB_URL` 相同的非系统数据库。每次测试创建随机 `foundation_it_*` / `endpoint_it_*` / `task_it_*` / `push_it_*` schema，只删除本次随机 schema，不清空数据库或修改现有业务 schema。真实协议服务仅监听回环地址，使用临时目录和测试凭据。测试覆盖空库 V1→V6、已含固定推送记录的 V4→V6 增量迁移、JPA、重启保留、测试专用 V7 升级、页面防伪、双协议能力、任务幂等、领取、通知补发及故障回滚等。
 
 首次启动由 Flyway 在应用 schema 建立迁移历史与 `platform_metadata`，通过 `PlatformMetadata` 实体和 `JpaRepository` 读写。Hibernate 使用 `ddl-auto=validate` 校验映射，关闭 Open Session in View；不自动创建或修改表。V1 只保存平台元数据，不预建业务表。后续升级新增 Flyway 迁移，不改写已执行 SQL。JPA 改造兼容已有 V1 表，不需要删表或重新建库。测试专用迁移不进入应用 JAR。失败迁移直接阻止启动，不执行 Flyway clean。
 

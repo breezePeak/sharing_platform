@@ -13,9 +13,11 @@ public class ProbeStore {
     private final EndpointRevisionRepository revisions;
     private final EndpointProbeRepository probes;
     private final EndpointOperationRepository operations;
+    private final EndpointCapacity capacity;
     public ProbeStore(EndpointRepository endpoints, EndpointRevisionRepository revisions,
-                      EndpointProbeRepository probes, EndpointOperationRepository operations) {
+                      EndpointProbeRepository probes, EndpointOperationRepository operations, EndpointCapacity capacity) {
         this.endpoints = endpoints; this.revisions = revisions; this.probes = probes; this.operations = operations;
+        this.capacity = capacity;
     }
 
     @Transactional
@@ -24,7 +26,7 @@ public class ProbeStore {
         if (!e.enabled) throw new IllegalArgumentException("停用连接不能开始新检测");
         if (e.revision != revision) throw new ResponseStatusException(HttpStatus.CONFLICT);
         EndpointRevision r = revisions.findByEndpointIdAndRevision(endpointId, revision).orElseThrow();
-        if (probes.countByEndpointIdAndStatus(endpointId, "RUNNING") >= r.concurrency)
+        if (!capacity.available(endpointId, r.concurrency, null))
             throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS);
         EndpointProbe p = new EndpointProbe();
         p.id = UUID.randomUUID().toString(); p.endpointId = endpointId; p.revisionId = r.id;

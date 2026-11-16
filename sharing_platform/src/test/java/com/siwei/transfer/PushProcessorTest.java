@@ -9,8 +9,7 @@ import static org.assertj.core.api.Assertions.*;
 
 class PushProcessorTest {
     @TempDir Path root;
-    private final PushProcessor processor = new PushProcessor(null, null, null, new TransferSettings(), null,
-            org.mockito.Mockito.mock(org.springframework.transaction.PlatformTransactionManager.class));
+    private final PushProcessor processor = new PushProcessor(null, null, null, new TransferSettings(), null);
 
     private Task task(String... paths) {
         Task task = new Task();
