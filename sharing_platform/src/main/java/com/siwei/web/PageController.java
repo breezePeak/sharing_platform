@@ -14,7 +14,7 @@ public class PageController {
     @GetMapping("/services")
     public String services(Model model) {
         model.addAttribute("title", "当前服务");
-        model.addAttribute("message", "可前往平台配置维护 FTP/SFTP 连接并检测能力。服务运行汇总、监听与传输任务尚未开放。");
+        model.addAttribute("message", "可前往平台配置维护 FTP/SFTP 连接，并在监听配置中查看拉取扫描和关联任务。");
         return "overview";
     }
 

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>监听配置 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header">
+    <h1 th:text="${listener == null ? '新增监听' : '编辑监听'}"></h1>
+    <a class="button button-secondary" th:href="@{/config/listeners}">返回监听列表</a>
+  </div>
+  <form method="post" class="panel fields"
+        th:action="${listener == null} ? @{/config/listeners} : @{/config/listeners/{id}(id=${listener.id})}">
+    <input type="hidden" name="_csrf" th:value="${csrfToken}">
+    <input th:if="${listener != null}" type="hidden" name="editVersion" th:value="${listener.edit_version}">
+    <div class="form-grid">
+      <label>监听名称<input name="name" maxlength="100" required th:value="${listener == null ? '' : listener.name}"></label>
+      <label>拉取来源
+        <select name="sourceId" required>
+          <option value="">请选择来源</option>
+          <option th:each="source : ${sources}" th:value="${source}" th:text="${source}"
+                  th:selected="${listener != null && source == listener.source_id}"></option>
+        </select>
+      </label>
+      <label>扫描范围（相对连接读取根）
+        <input name="sourcePath" maxlength="1000" required th:value="${listener == null ? '' : listener.source_path}">
+      </label>
+      <label>扫描周期（秒）
+        <input name="period" type="number" min="1" max="86400" required th:value="${listener == null ? 60 : listener.period_seconds}">
+      </label>
+      <label th:if="${listener == null}">首次扫描
+        <select name="mode">
+          <option value="IMPORT_EXISTING">导入已有数据</option>
+          <option value="BASELINE_ONLY">登记首次完整扫描的基线</option>
+        </select>
+      </label>
+    </div>
+    <div th:if="${listener != null}">
+      <input type="hidden" name="mode" th:value="${listener.initial_mode}">
+      <p th:text="|当前规则版本 ${listener.revision} · ${listener.unitType} · 层级 ${listener.scanDepth} · 匹配 ${listener.filePattern}|"></p>
+      <p th:text="|${listener.validation} 校验 · 目标 ${listener.targetRef} · 接收方 ${listener.recipientId}|"></p>
+      <p th:if="${listener.manifestName != null || listener.readyName != null}"
+         th:text="|完成依据 ${listener.manifestName ?: ''} ${listener.readyName ?: ''}|"></p>
+      <p th:if="${listener.manifestName == null && listener.readyName == null}"
+         th:text="|稳定观察至少 ${listener.stableObservations} 次、${listener.minimumObservationSeconds} 秒|"></p>
+      <label><input type="checkbox" name="inherit" value="true"> 按新范围补扫，保留已处理交付和原基线。新增范围中的未交付数据将按就绪规则拉取。</label>
+    </div>
+    <p class="field-hint">数据单元、就绪规则、校验和接收方继承自来源配置。</p>
+    <div class="actions"><button th:disabled="${#sets.isEmpty(sources)}">保存监听</button></div>
+  </form>
+</main>
+</body>
+</html>

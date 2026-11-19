@@ -8,6 +8,8 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.*;
+import java.sql.Timestamp;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.*;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -25,27 +27,33 @@ public class PullProcessor implements TaskProcessor {
     private final RemoteFileClientFactory clients;
     private final TransferSettings settings;
     private final TransactionTemplate tx;
+    private final Clock clock;
 
     public PullProcessor(PullStore db, TransferJpa outbox, ObjectMapper json, EndpointRevisionRepository revisions,
                          RemoteFileClientFactory clients, TransferSettings settings,
-                         org.springframework.transaction.PlatformTransactionManager manager) {
+                         org.springframework.transaction.PlatformTransactionManager manager, Clock clock) {
         this.db = db; this.outbox = outbox; this.json = json; this.revisions = revisions;
         this.clients = clients; this.settings = settings; this.tx = new TransactionTemplate(manager);
+        this.clock = clock;
     }
     @Override public String direction() { return "PULL"; }
 
     @Override public Result process(Task task) throws Exception {
-        var record = db.one("SELECT pull_config,pull_scan_complete,claim_id FROM transfer_task WHERE id=?", task.taskRecordId);
+        var record = db.one("SELECT pull_config,pull_scan_complete,claim_id,listener_id FROM transfer_task WHERE id=?", task.taskRecordId);
         JsonNode config = json.readTree((String) record.get("pull_config"));
         EndpointRevision endpoint = revisions.findById(task.endpointRevisionId).orElseThrow();
-        String scope = ControlledPaths.resolve(endpoint.readRoot, json.readTree(task.canonicalRequest).path("sourcePath").asText());
+        String scope = ControlledPaths.resolve(endpoint.readRoot, config.path("requestPath")
+                .asText(json.readTree(task.canonicalRequest).path("sourcePath").asText()));
+        String listener = (String) record.get("listener_id");
         String claim = (String) record.get("claim_id");
         if (claim == null || !claim.equals(task.claimId)) throw new IllegalStateException("TASK_NOT_CLAIMED");
         List<Map<String, Object>> units = db.rows("SELECT * FROM pull_task_unit WHERE task_id=? ORDER BY source_path", task.taskRecordId);
         boolean needsRemote = !(Boolean) record.get("pull_scan_complete") || units.stream().anyMatch(u -> u.get("transfer_id") == null && !"FAILED".equals(u.get("status")));
         boolean workNeeded = needsRemote;
         for (var unit : units) if (unit.get("transfer_id") != null) {
-            String state = (String) db.one("SELECT status FROM pull_transfer WHERE id=?", unit.get("transfer_id")).get("status");
+            var delivery = transfer((String) unit.get("transfer_id"));
+            String state = (String) delivery.get("status");
+            if (!"SOURCE_CHANGED".equals(state) && !task.endpointRevisionId.equals(delivery.get("owner_revision"))) continue;
             if (!Set.of("PUBLISHED", "FAILED").contains(state)) {
                 workNeeded = true;
                 if (!state.equals("PUBLISHING")) needsRemote = true;
@@ -53,7 +61,7 @@ public class PullProcessor implements TaskProcessor {
         }
         if (workNeeded) try (RemoteFileClient remote = needsRemote ? clients.connect(endpoint) : null) {
             if (!(Boolean) record.get("pull_scan_complete")) {
-                List<String> paths = discover(remote, scope, config, task);
+                List<String> paths = discover(remote, scope, config);
                 if (paths == null) return waiting();
                 tx.executeWithoutResult(status -> {
                     for (String path : paths) db.update("INSERT INTO pull_task_unit(task_id,source_path) VALUES (?,?) ON CONFLICT DO NOTHING", task.taskRecordId, path);
@@ -73,21 +81,23 @@ public class PullProcessor implements TaskProcessor {
                     }
                 }
                 if (transfer == null) {
-                    candidate(task, path, config);
+                    Instant started = clock.instant();
                     try {
                         ObjectNode observation = observe(remote, path, config);
-                        transfer = freeze(task, path, config, observation);
+                        transfer = freeze(task, path, config, observation, started, listener);
                         db.update("UPDATE pull_task_unit SET attempts=0 WHERE task_id=? AND source_path=?", task.taskRecordId, path);
                     } catch (NotReady error) {
-                        db.update("UPDATE pull_candidate SET last_error=? WHERE candidate_key=?", error.getMessage(), candidateKey(task, path, config));
+                        candidateError(task.endpointId, path, config, started, error.getMessage());
                         db.update("UPDATE pull_task_unit SET error_type=? WHERE task_id=? AND source_path=?", error.getMessage(), task.taskRecordId, path);
                         continue;
                     } catch (IOException | IllegalArgumentException error) {
+                        candidateError(task.endpointId, path, config, started, reason(error));
                         unitFailure(task, path, error);
                         continue;
                     }
                 }
-                if (transfer != null) execute(remote, task, transfer, claim, endpoint.concurrency);
+                if (transfer != null && task.endpointRevisionId.equals(transfer(transfer).get("owner_revision")))
+                    execute(remote, task, transfer, claim, endpoint.concurrency);
             }
         }
         remind(task.taskRecordId, config.path("acceptanceSeconds").asInt());
@@ -100,31 +110,44 @@ public class PullProcessor implements TaskProcessor {
         try { db.aggregate(task, claim, json.readTree(config).path("observationSeconds").asInt()); }
         catch (com.fasterxml.jackson.core.JsonProcessingException e) { throw new IllegalStateException(e); }
     }
+
+    void failUnstartedDeliveries(String task, String claim, String reason) {
+        tx.executeWithoutResult(status -> {
+            for (var delivery : db.rows("SELECT id FROM pull_transfer WHERE owner_task_id=? AND status='DOWNLOADING' AND claim_id IS NULL ORDER BY id", task)) {
+                String id = (String) delivery.get("id");
+                if (db.update("UPDATE pull_transfer SET status='FAILED',error_type=? WHERE id=? AND status='DOWNLOADING' AND claim_id IS NULL "
+                                + "AND EXISTS (SELECT 1 FROM transfer_task WHERE id=? AND claim_id=?)",
+                        reason, id, task, claim) == 1) notification(id, false, reason);
+            }
+        });
+    }
     private static Result waiting() { return new Result("WAITING_SOURCE", "PULL", null, null); }
 
-    private List<String> discover(RemoteFileClient remote, String scope, JsonNode config, Task task) throws IOException {
+    List<String> discover(RemoteFileClient remote, String scope, JsonNode config) throws IOException {
         if (!exists(remote, scope, config.path("remoteRoot").asText())) return null;
         if (config.path("scanDepth").asInt() == 0) return List.of(scope);
         List<String> result = new ArrayList<>();
-        discoverAt(remote, scope, config.path("scanDepth").asInt(), config, result, task);
+        discoverAt(remote, scope, config.path("scanDepth").asInt(), config, result, new int[1]);
         Collections.sort(result);
         return result;
     }
-    private void discoverAt(RemoteFileClient remote, String root, int depth, JsonNode config, List<String> found, Task task) throws IOException {
+    private void discoverAt(RemoteFileClient remote, String root, int depth, JsonNode config, List<String> found, int[] visited) throws IOException {
         for (RemoteFileClient.Entry entry : remote.list(root)) {
             safeName(entry.name); ordinary(entry);
-            String path = root + "/" + entry.name;
+            String path = root.equals("/") ? root + entry.name : root + "/" + entry.name;
+            if (++visited[0] > 100000 || path.length() > 1000) throw new InvalidSource("SCAN_TOO_LARGE");
             if (depth > 1) {
-                if (entry.directory) discoverAt(remote, path, depth - 1, config, found, task);
+                if (entry.directory) discoverAt(remote, path, depth - 1, config, found, visited);
             } else if ((config.path("unitType").asText().equals("FILE") ? entry.regular : entry.directory)
-                    && !isControl(entry.name, config) && matches(entry.name, config)) {
-                candidate(task, path, config); found.add(path);
+                    && selected(entry.name, config)) {
+                found.add(path);
             }
             if (found.size() > 10000) throw new InvalidSource("TOO_MANY_UNITS");
         }
     }
-    private static boolean matches(String name, JsonNode config) {
-        return FileSystems.getDefault().getPathMatcher("glob:" + config.path("filePattern").asText()).matches(Paths.get(name));
+    static boolean selected(String name, JsonNode config) {
+        return !isControl(name, config)
+                && FileSystems.getDefault().getPathMatcher("glob:" + config.path("filePattern").asText()).matches(Paths.get(name));
     }
 
     ObjectNode observe(RemoteFileClient remote, String path, JsonNode config) throws IOException {
@@ -212,66 +235,128 @@ public class PullProcessor implements TaskProcessor {
         if (entry.modifiedMillis == null) f.putNull("modifiedMillis"); else f.put("modifiedMillis", entry.modifiedMillis);
     }
 
-    private String freeze(Task task, String path, JsonNode config, ObjectNode observation) {
-        String candidate = candidateKey(task, path, config);
-        String observed = observation.toString();
+    private String freeze(Task task, String path, JsonNode config, ObjectNode observation, Instant at, String listener) {
         return tx.execute(status -> {
-            db.update("INSERT INTO pull_candidate(candidate_key,source_id,source_path,observation,stable_count,observed_at) VALUES (?,?,?,?,1,now()) ON CONFLICT DO NOTHING",
-                    candidate, config.path("sourceId").asText(), path, observed);
-            Map<String, Object> row = db.one("SELECT *,observed_at<=now()-(? * interval '1 second') AS due FROM pull_candidate WHERE candidate_key=? FOR UPDATE",
-                    config.path("observationSeconds").asInt(), candidate);
-            int stable = ((Number) row.get("stable_count")).intValue();
-            db.update("UPDATE pull_candidate SET last_error=NULL WHERE candidate_key=?", candidate);
-            if (!observed.equals(row.get("observation"))) {
-                stable = 1;
-                db.update("UPDATE pull_candidate SET observation=?,stable_count=1,observed_at=now(),last_error=NULL WHERE candidate_key=?", observed, candidate);
-            } else if ((Boolean) row.get("due")) {
-                stable++;
-                db.update("UPDATE pull_candidate SET stable_count=?,observed_at=now(),last_error=NULL WHERE candidate_key=?", stable, candidate);
+            Version version = version(task.endpointId, path, config, observation);
+            if (baselined(listener, version.key)) {
+                db.update("DELETE FROM pull_task_unit WHERE task_id=? AND source_path=?", task.taskRecordId, path);
+                return null;
             }
-            String reason = !observation.path("ready").asBoolean() ? observation.path("reason").asText() : null;
-            if (reason == null && !config.hasNonNull("readyName") && stable < config.path("stableObservations").asInt()) reason = "STABILIZING";
+            String reason = recordObservation(task.endpointId, path, config, observation, at);
             if (reason != null) {
                 db.update("UPDATE pull_task_unit SET error_type=? WHERE task_id=? AND source_path=?", reason, task.taskRecordId, path);
                 return null;
             }
-            String basis = observation.has("manifestSha256") ? "MANIFEST_SHA256" : "SIZE_MTIME_SET";
-            String version = TaskWorker.sha256(basis + "\n" + (observation.has("manifestSha256") ? observation.path("manifestSha256").asText() : observed));
-            String key = TaskWorker.sha256(task.endpointId + "\n" + path + "\n" + rule(config) + "\n" + basis + "\n" + version + "\n" + deliveryScope(config));
-            db.update("INSERT INTO pull_delivery_key(delivery_key) VALUES (?) ON CONFLICT DO NOTHING", key);
-            String current = (String) db.one("SELECT current_transfer_id FROM pull_delivery_key WHERE delivery_key=? FOR UPDATE", key).get("current_transfer_id");
-            if (current == null || "SOURCE_CHANGED".equals(transfer(current).get("status")))
-                current = create(task.taskRecordId, task.endpointId, path, version, basis, observed, config.toString(), key, current);
+            String current = currentDelivery(task.endpointId, path, config, version);
+            if (needsTransfer(current))
+                current = create(task.taskRecordId, task.endpointId, path, config, observation, version, current);
             link(task.taskRecordId, path, current);
             return current;
         });
     }
-    private String create(String task, String endpoint, String path, String version, String basis, String observed, String config, String key, String previous) {
+
+    String recordObservation(String endpoint, String path, JsonNode config, ObjectNode observation, Instant at) {
+        at = at.truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        String key = candidateKey(endpoint, path, config);
+        String observed = observation.toString();
+        Timestamp stamp = Timestamp.from(at);
+        db.update("INSERT INTO pull_candidate(candidate_key,source_id,source_path,observation,stable_count,observed_at,first_observed_at,last_seen_at) VALUES (?,?,?,?,1,?,?,?) ON CONFLICT DO NOTHING",
+                key, config.path("sourceId").asText(), path, observed, stamp, stamp, stamp);
+        Map<String, Object> row = db.one("SELECT *,last_seen_at>cast(? AS timestamptz) AS stale FROM pull_candidate WHERE candidate_key=? FOR UPDATE", stamp, key);
+        if (Boolean.TRUE.equals(row.get("stale"))) return "NEWER_OBSERVATION_EXISTS";
+        int stable = ((Number) row.get("stable_count")).intValue();
+        Instant first = row.get("first_observed_at") == null ? at : ((Timestamp) row.get("first_observed_at")).toInstant();
+        Instant last = ((Timestamp) row.get("observed_at")).toInstant();
+        if (stable == 0 || !observed.equals(row.get("observation"))) {
+            stable = 1;
+            first = last = at;
+        } else if (!at.isBefore(last.plusSeconds(config.path("observationSeconds").asInt()))) {
+            stable++;
+            last = at;
+        }
+        String reason = !observation.path("ready").asBoolean() ? observation.path("reason").asText() : null;
+        if (reason == null && !observation.has("manifestSha256") && !config.hasNonNull("readyName")
+                && (stable < config.path("stableObservations").asInt()
+                || at.isBefore(first.plusSeconds(config.path("minimumObservationSeconds").asInt(0))))) reason = "STABILIZING";
+        db.update("UPDATE pull_candidate SET observation=?,stable_count=?,observed_at=?,first_observed_at=?,last_seen_at=?,last_error=? WHERE candidate_key=?",
+                observed, stable, Timestamp.from(last), Timestamp.from(first), stamp, reason, key);
+        return reason;
+    }
+
+    void candidateError(String endpoint, String path, JsonNode config, Instant at, String error) {
+        Timestamp stamp = Timestamp.from(at);
+        db.update("INSERT INTO pull_candidate(candidate_key,source_id,source_path,observation,stable_count,observed_at,last_seen_at,last_error) VALUES (?,?,?,'{}',0,?,?,?) "
+                + "ON CONFLICT(candidate_key) DO UPDATE SET last_error=excluded.last_error,last_seen_at=excluded.last_seen_at WHERE pull_candidate.last_seen_at<=excluded.last_seen_at",
+                candidateKey(endpoint, path, config), config.path("sourceId").asText(), path, stamp, stamp, error);
+    }
+
+    static Version version(String endpoint, String path, JsonNode config, ObjectNode observation) {
+        String basis = observation.has("manifestSha256") ? "MANIFEST_SHA256" : "SIZE_MTIME_SET";
+        String hash = TaskWorker.sha256(basis + "\n" + (observation.has("manifestSha256") ? observation.path("manifestSha256").asText() : observation.toString()));
+        String key = TaskWorker.sha256(endpoint + "\n" + path + "\n" + versionRule(config) + "\n" + basis + "\n" + hash + "\n" + deliveryScope(config));
+        return new Version(key, hash, basis);
+    }
+
+    boolean baselined(String listener, String key) {
+        return listener != null && !db.rows("SELECT 1 AS present FROM pull_listener_baseline WHERE listener_id=? AND delivery_key=?", listener, key).isEmpty();
+    }
+
+    String currentDelivery(String endpoint, String path, JsonNode config, Version version) {
+        db.update("INSERT INTO pull_delivery_key(delivery_key) VALUES (?) ON CONFLICT DO NOTHING", version.key);
+        String current = (String) db.one("SELECT current_transfer_id FROM pull_delivery_key WHERE delivery_key=? FOR UPDATE", version.key).get("current_transfer_id");
+        if (current != null) return current;
+        // Existing PR-05 keys also included the discovery glob. Adopt their current rounds.
+        for (var old : db.rows("SELECT t.id,t.config FROM pull_transfer t JOIN pull_delivery_key k ON k.current_transfer_id=t.id "
+                + "WHERE t.endpoint_id=? AND t.source_path=? AND t.source_version=? AND t.version_basis=? ORDER BY t.created_at DESC,t.id",
+                endpoint, path, version.hash, version.basis)) {
+            JsonNode previous = parseConfig((String) old.get("config"));
+            if (versionRule(previous).equals(versionRule(config)) && deliveryScope(previous).equals(deliveryScope(config))) {
+                current = (String) old.get("id");
+                db.update("UPDATE pull_delivery_key SET current_transfer_id=? WHERE delivery_key=?", current, version.key);
+                break;
+            }
+        }
+        return current;
+    }
+
+    JsonNode parseConfig(String config) {
+        try { return json.readTree(config); }
+        catch (com.fasterxml.jackson.core.JsonProcessingException error) { throw new IllegalStateException(error); }
+    }
+
+    boolean needsTransfer(String current) {
+        return current == null || "SOURCE_CHANGED".equals(transfer(current).get("status"));
+    }
+
+    String create(String task, String endpoint, String path, JsonNode config, ObjectNode observation, Version version, String previous) {
         String id = UUID.randomUUID().toString();
         db.update("INSERT INTO pull_transfer(id,delivery_key,previous_transfer_id,owner_task_id,endpoint_id,source_path,source_version,version_basis,version_strength,observation,config) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                id, key, previous, task, endpoint, path, version, basis, basis.equals("MANIFEST_SHA256") ? "STRONG" : "WEAK", observed, config);
-        db.update("UPDATE pull_delivery_key SET current_transfer_id=? WHERE delivery_key=?", id, key);
-        try {
-            for (JsonNode f : json.readTree(observed).path("files")) db.update("INSERT INTO pull_file(transfer_id,relative_path,size_bytes,expected_hash) VALUES (?,?,?,?)",
-                    id, f.path("path").asText(), f.path("size").asLong(), f.path("expectedHash").asText(null));
-        } catch (com.fasterxml.jackson.core.JsonProcessingException error) { throw new IllegalStateException(error); }
+                id, version.key, previous, task, endpoint, path, version.hash, version.basis,
+                version.basis.equals("MANIFEST_SHA256") ? "STRONG" : "WEAK", observation.toString(), config.toString());
+        db.update("UPDATE pull_delivery_key SET current_transfer_id=? WHERE delivery_key=?", id, version.key);
+        for (JsonNode f : observation.path("files")) db.update("INSERT INTO pull_file(transfer_id,relative_path,size_bytes,expected_hash) VALUES (?,?,?,?)",
+                id, f.path("path").asText(), f.path("size").asLong(), f.path("expectedHash").asText(null));
         return id;
     }
-    private void link(String task, String path, String transfer) {
+    void link(String task, String path, String transfer) {
         db.update("INSERT INTO pull_task_transfer(task_id,transfer_id) VALUES (?,?) ON CONFLICT DO NOTHING", task, transfer);
         db.update("UPDATE pull_task_unit SET transfer_id=?,status='LINKED',error_type=NULL WHERE task_id=? AND source_path=?", transfer, task, path);
     }
     private static String rule(JsonNode c) { return c.path("unitType").asText() + "\n" + c.path("filePattern").asText() + "\n" + c.path("manifestName").asText() + "\n" + c.path("readyName").asText(); }
-    private static String candidateKey(Task task, String path, JsonNode config) {
-        return TaskWorker.sha256(config.path("sourceId").asText() + "\n" + task.endpointId + "\n" + path + "\n" + rule(config)
+    static String versionRule(JsonNode c) {
+        return c.path("unitType").asText() + "\n" + c.path("manifestName").asText() + "\n" + c.path("readyName").asText();
+    }
+    static String candidateKey(String endpoint, String path, JsonNode config) {
+        return TaskWorker.sha256(config.path("sourceId").asText() + "\n" + endpoint + "\n" + path + "\n" + rule(config)
                 + "\n" + config.path("stableObservations").asInt() + "\n" + config.path("observationSeconds").asInt());
     }
-    private void candidate(Task task, String path, JsonNode config) {
-        db.update("INSERT INTO pull_candidate(candidate_key,source_id,source_path,observation,stable_count,observed_at,last_error) VALUES (?,?,?,'{}',0,now(),'NOT_OBSERVED') ON CONFLICT DO NOTHING",
-                candidateKey(task, path, config), config.path("sourceId").asText(), path);
-    }
-    private static String deliveryScope(JsonNode c) {
+    static String deliveryScope(JsonNode c) {
         return c.path("localRoot").asText() + "\n" + c.path("accessBase").asText() + "\n" + c.path("recipientId").asText() + "\n" + c.path("validation").asText();
+    }
+
+    static final class Version {
+        final String key, hash, basis;
+        Version(String key, String hash, String basis) { this.key = key; this.hash = hash; this.basis = basis; }
     }
 
     private void execute(RemoteFileClient remote, Task task, String id, String claim, int concurrency) throws Exception {
@@ -449,7 +534,9 @@ public class PullProcessor implements TaskProcessor {
             try { config = json.readTree((String) transfer.get("config")); }
             catch (com.fasterxml.jackson.core.JsonProcessingException error) { throw new IllegalStateException(error); }
             if (!recipient.equals(config.path("recipientId").asText())) throw TaskService.error(HttpStatus.FORBIDDEN, "RECIPIENT_FORBIDDEN");
-            String current = (String) db.one("SELECT current_transfer_id FROM pull_delivery_key WHERE delivery_key=? FOR UPDATE", transfer.get("delivery_key")).get("current_transfer_id");
+            String path = (String) transfer.get("source_path"), endpoint = (String) transfer.get("endpoint_id");
+            String current = currentDelivery(endpoint, path, config,
+                    version(endpoint, path, config, (ObjectNode) parseConfig((String) transfer.get("observation"))));
             transfer = db.one("SELECT * FROM pull_transfer WHERE id=? FOR UPDATE", id);
             String previous = (String) transfer.get("acceptance_status");
             String disposition;
@@ -476,19 +563,21 @@ public class PullProcessor implements TaskProcessor {
     public String redeliver(String id, String repairReason) throws Exception {
         if (repairReason == null || repairReason.isBlank() || repairReason.length() > 1000) throw new IllegalArgumentException("REPAIR_REASON_REQUIRED");
         var old = transfer(id);
-        JsonNode config = json.readTree((String) old.get("config")), frozen = json.readTree((String) old.get("observation"));
+        JsonNode config = json.readTree((String) old.get("config"));
+        ObjectNode frozen = (ObjectNode) json.readTree((String) old.get("observation"));
+        String endpointId = (String) old.get("endpoint_id"), path = (String) old.get("source_path");
+        Version version = version(endpointId, path, config, frozen);
         var task = db.one("SELECT endpoint_revision_id FROM transfer_task WHERE id=?", old.get("owner_task_id"));
         EndpointRevision endpoint = revisions.findById((String) task.get("endpoint_revision_id")).orElseThrow();
         try (RemoteFileClient remote = clients.connect(endpoint)) {
             if (!observe(remote, (String) old.get("source_path"), config).toString().equals(frozen.toString())) throw new Changed();
         }
         return tx.execute(status -> {
-            String current = (String) db.one("SELECT current_transfer_id FROM pull_delivery_key WHERE delivery_key=? FOR UPDATE", old.get("delivery_key")).get("current_transfer_id");
+            String current = currentDelivery(endpointId, path, config, version);
             var locked = db.one("SELECT status,claim_id FROM pull_transfer WHERE id=? FOR UPDATE", id);
             if (!id.equals(current) || locked.get("claim_id") != null || !Set.of("PUBLISHED", "FAILED").contains(locked.get("status")))
                 throw TaskService.error(HttpStatus.CONFLICT, "REDELIVERY_CONFLICT");
-            String next = create((String) old.get("owner_task_id"), (String) old.get("endpoint_id"), (String) old.get("source_path"),
-                    (String) old.get("source_version"), (String) old.get("version_basis"), (String) old.get("observation"), (String) old.get("config"), (String) old.get("delivery_key"), id);
+            String next = create((String) old.get("owner_task_id"), endpointId, path, config, frozen, version, id);
             db.update("INSERT INTO pull_receipt(transfer_id,recipient_id,payload,outcome) VALUES (?,'OPERATOR',?,'REDELIVERED')", id, repairReason);
             for (var linked : db.rows("SELECT task_id,source_path FROM pull_task_unit WHERE transfer_id=? ORDER BY task_id", id)) {
                 String taskId = (String) linked.get("task_id");
@@ -507,7 +596,6 @@ public class PullProcessor implements TaskProcessor {
     private void unitFailure(Task task, String path, Exception error) {
         tx.executeWithoutResult(status -> {
             db.update("UPDATE pull_task_unit SET attempts=attempts+1,error_type=? WHERE task_id=? AND source_path=?", reason(error), task.taskRecordId, path);
-            db.update("UPDATE pull_candidate SET last_error=? WHERE source_id=(SELECT cast(pull_config AS json)->>'sourceId' FROM transfer_task WHERE id=?) AND source_path=?", reason(error), task.taskRecordId, path);
             var unit = db.one("SELECT attempts FROM pull_task_unit WHERE task_id=? AND source_path=?", task.taskRecordId, path);
             if (error instanceof InvalidSource || error instanceof IllegalArgumentException || ((Number) unit.get("attempts")).intValue() >= 4) {
                 db.update("UPDATE pull_task_unit SET status='FAILED' WHERE task_id=? AND source_path=?", task.taskRecordId, path);
@@ -523,7 +611,10 @@ public class PullProcessor implements TaskProcessor {
             }
         });
     }
-    private Map<String, Object> transfer(String id) { return db.one("SELECT * FROM pull_transfer WHERE id=?", id); }
+    private Map<String, Object> transfer(String id) {
+        return db.one("SELECT t.*,o.endpoint_revision_id AS owner_revision FROM pull_transfer t "
+                + "JOIN transfer_task o ON o.id=t.owner_task_id WHERE t.id=?", id);
+    }
     private static String reason(Exception error) { return error.getMessage() != null && error.getMessage().matches("[A-Z][A-Z0-9_]{2,80}") ? error.getMessage() : error.getClass().getSimpleName(); }
     private static String location(JsonNode config, String id) { return config.path("accessBase").asText().replaceAll("/+$", "") + "/pending/" + id + "/"; }
     private static String control(String path, boolean file, String name) { return path + (file ? "." : "/") + name; }

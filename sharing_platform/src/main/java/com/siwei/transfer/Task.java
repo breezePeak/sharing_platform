@@ -7,6 +7,8 @@ public class Task {
     @com.fasterxml.jackson.annotation.JsonIgnore public String claimId;
     public String taskRecordId, callerId, taskId, entryType, direction, endpointId, endpointRevisionId;
     public String canonicalRequest, executionStatus, phase, acceptanceStatus, errorType, errorDetail;
+    public String triggerType, listenerId;
+    public Integer listenerRevision;
     public String routeVersion;
     public Instant createdAt, updatedAt;
     public Long totalFiles, totalBytes;

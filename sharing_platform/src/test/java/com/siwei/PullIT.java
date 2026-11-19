@@ -11,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.sql.DriverManager;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
@@ -40,6 +42,18 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureMockMvc
 @DirtiesContext
 class PullIT {
+    @org.springframework.boot.test.context.TestConfiguration
+    static class TestTime {
+        @org.springframework.context.annotation.Bean @org.springframework.context.annotation.Primary
+        MutableClock testClock() { return new MutableClock(); }
+    }
+    static class MutableClock extends java.time.Clock {
+        final AtomicReference<Instant> time = new AtomicReference<>();
+        @Override public ZoneId getZone() { return ZoneId.of("UTC"); }
+        @Override public java.time.Clock withZone(ZoneId zone) { return java.time.Clock.fixed(instant(), zone); }
+        @Override public Instant instant() { Instant value = time.get(); return value == null ? Instant.now() : value; }
+        void advance(int seconds) { time.updateAndGet(value -> value.plusSeconds(seconds)); }
+    }
     private static final String URL = TestDatabase.requireUrl(System.getenv());
     private static final String USER = TestDatabase.require(System.getenv(), "TEST_DB_USERNAME");
     private static final String PASSWORD = TestDatabase.require(System.getenv(), "TEST_DB_PASSWORD");
@@ -78,26 +92,410 @@ class PullIT {
         p.add("platform.transfers.callers.pull.notification-url", () -> "http://127.0.0.1:" + receiverPort() + "/notify");
         p.add("platform.transfers.callers.other.token", () -> "other-test-token");
         p.add("platform.transfers.callers.other.notification-url", () -> "http://127.0.0.1:" + receiverPort() + "/notify");
+        p.add("platform.pulls.listeners.workers", () -> "2");
     }
     @Autowired EndpointService endpoints;
     @Autowired EndpointRevisionRepository revisions;
     @Autowired EndpointSettings endpointSettings;
-    @Autowired RemoteFileClientFactory clients;
+    @org.springframework.boot.test.mock.mockito.SpyBean RemoteFileClientFactory clients;
     @Autowired PullSettings pullSettings;
     @Autowired TransferSettings transferSettings;
     @Autowired PullProcessor pulls;
+    @Autowired PullListenerService listeners;
+    @org.springframework.boot.test.mock.mockito.SpyBean PullListenerScanner scanner;
     @Autowired PullStore store;
     @Autowired TransferJpa taskDb;
     @Autowired TaskService tasks;
     @org.springframework.boot.test.mock.mockito.SpyBean TaskWorker worker;
     @org.springframework.boot.test.mock.mockito.SpyBean NotificationDispatcher notifications;
     @Autowired org.springframework.transaction.PlatformTransactionManager manager;
+    @Autowired MutableClock clock;
     @Autowired ObjectMapper json;
     @Autowired JdbcTemplate db;
     @Autowired MockMvc mvc;
     @TempDir Path remoteRoot;
 
-    @BeforeEach void controlTaskScheduling() { doNothing().when(worker).poll(); doNothing().when(notifications).poll(); }
+    @BeforeEach void controlTaskScheduling() {
+        doNothing().when(worker).poll();
+        doNothing().when(notifications).poll();
+        doNothing().when(scanner).poll();
+    }
+
+    @AfterEach void stopListeners() {
+        db.update("UPDATE pull_listener SET enabled=false,manual_pending=false");
+        clock.time.set(null);
+    }
+
+    @Test void listenersKeepProtocolTargetsIndependentAndCoalesceDueScans() throws Exception {
+        clock.time.set(Instant.now());
+        Path ftpRoot = remoteRoot.resolve("ftp");
+        Files.createDirectories(ftpRoot.resolve("north")); Files.createDirectories(ftpRoot.resolve("south"));
+        Files.writeString(ftpRoot.resolve("north/a.bin"), "north");
+        Files.writeString(ftpRoot.resolve("south/b.bin"), "south");
+        try (ProtocolServers ftp = new ProtocolServers(ftpRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL);
+             ProtocolServers sftp = new ProtocolServers(remoteRoot.resolve("sftp"), EndpointRevision.Protocol.SFTP, ProtocolServers.Mode.NORMAL);
+             StreamingFtpServer broken = new StreamingFtpServer(StreamingFtpServer.Fault.WELCOME)) {
+            String northSource = source(ftp, EndpointRevision.Protocol.FTP, "FILE", "north");
+            String ftpEndpoint = pullSettings.getSources().get(northSource).getEndpointId();
+            String southSource = sourceOn(ftpEndpoint, "FILE", "south");
+            String sshSource = source(sftp, EndpointRevision.Protocol.SFTP, "FILE", "sample.bin");
+            EndpointForm unreachable = ftp.form(EndpointRevision.Protocol.FTP);
+            unreachable.port = broken.port(); unreachable.timeoutSeconds = 1; unreachable.localTargetRef = "delivery";
+            String brokenEndpoint = endpoints.save(null, unreachable);
+            transferSettings.getCallers().get("pull").getEndpointIds().add(brokenEndpoint);
+            String brokenSource = sourceOn(brokenEndpoint, "FILE", "incoming");
+            for (String source : List.of(northSource, southSource, brokenSource)) configured(source).setScanDepth(1);
+            for (String source : List.of(northSource, southSource, sshSource)) configured(source).setMinimumObservationSeconds(0);
+            String north = listener(northSource, 60, "IMPORT_EXISTING");
+            String south = listener(southSource, 75, "IMPORT_EXISTING");
+            String ssh = listener(sshSource, 120, "IMPORT_EXISTING");
+            String down = listener(brokenSource, 60, "IMPORT_EXISTING");
+            CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+            doAnswer(call -> {
+                RemoteFileClient real = (RemoteFileClient) call.callRealMethod();
+                if (!ftpEndpoint.equals(call.<EndpointRevision>getArgument(0).endpointId)) return real;
+                RemoteFileClient remote = mock(RemoteFileClient.class, org.mockito.AdditionalAnswers.delegatesTo(real));
+                doAnswer(list -> {
+                    entered.countDown();
+                    if (!release.await(15, TimeUnit.SECONDS)) throw new java.io.IOException("TEST_SCAN_TIMEOUT");
+                    return real.list("/north");
+                }).when(remote).list("/north");
+                return remote;
+            }).when(clients).connect(any());
+            try {
+                listeners.manual(north); // Ensure the first FTP target holds its endpoint's scan slot.
+                clock.advance(1);
+                db.update("UPDATE pull_listener SET next_run_at=? WHERE id=?", java.sql.Timestamp.from(clock.instant().minusSeconds(2)), north);
+                db.update("UPDATE pull_listener SET next_run_at=? WHERE id=?", java.sql.Timestamp.from(clock.instant().minusSeconds(1)), ssh);
+                pollListeners();
+                assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+                await(() -> "SUCCEEDED".equals(latest(ssh).get("status")));
+                assertThat(runCount(down)).isZero();
+                await(() -> {
+                    pollListeners();
+                    return "FAILED".equals(latest(down).get("status"));
+                });
+                assertThat(latest(down).get("error_type")).isEqualTo("SCAN_IO");
+                assertThat(runCount(south)).isZero();
+                clock.advance(61);
+                pollListeners();
+                assertThat(runCount(north)).isEqualTo(1);
+                assertThat(latest(north).get("coalesced_reason")).isEqualTo("PERIOD_COALESCED");
+                assertThat(latest(ssh).get("created_count")).isEqualTo(1);
+            } finally { release.countDown(); }
+            await(() -> "SUCCEEDED".equals(latest(north).get("status")));
+            await(() -> {
+                pollListeners();
+                return "SUCCEEDED".equals(latest(south).get("status"));
+            });
+            assertThat(latest(south).get("created_count")).isEqualTo(1);
+            assertThat(listenerTasks(south)).hasSize(1);
+            assertThatThrownBy(() -> listenerRequest(north, configured(sshSource).getEndpointId(), null))
+                    .hasMessageContaining("LISTENER_ENDPOINT_MISMATCH");
+            String task = listenerTasks(ssh).get(0);
+            runOnce(task, pulls);
+            assertThat(state(task)).isEqualTo("WAITING_ACCEPTANCE");
+        }
+    }
+
+    @Test void stableObservationsUseTheClockAndOnlyCompleteInventoriesChangeCandidates() throws Exception {
+        clock.time.set(Instant.now());
+        Path north = Files.createDirectories(remoteRoot.resolve("incoming/north"));
+        Path south = Files.createDirectories(remoteRoot.resolve("incoming/south"));
+        Files.writeString(north.resolve("a.bin"), "first");
+        Files.writeString(south.resolve("b.bin"), "second");
+        try (ProtocolServers ftp = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            String source = source(ftp, EndpointRevision.Protocol.FTP, "FILE", "incoming");
+            var config = configured(source);
+            config.setScanDepth(2); config.setStableObservations(3); config.setObservationSeconds(30);
+            String listener = listener(source, 60, "IMPORT_EXISTING");
+            manualScan(listener);
+            assertThat(stability(source, "/incoming/north/a.bin")).isEqualTo(1);
+            clock.advance(30);
+            Files.delete(north.resolve("a.bin"));
+            AtomicBoolean partial = new AtomicBoolean(true);
+            doAnswer(call -> {
+                RemoteFileClient real = (RemoteFileClient) call.callRealMethod();
+                RemoteFileClient remote = mock(RemoteFileClient.class, org.mockito.AdditionalAnswers.delegatesTo(real));
+                doAnswer(list -> {
+                    if (partial.get()) throw new java.io.IOException("TEST_PARTIAL_SCAN");
+                    return real.list("/incoming/south");
+                }).when(remote).list("/incoming/south");
+                return remote;
+            }).when(clients).connect(any());
+            assertThat(manualScan(listener).get("status")).isEqualTo("FAILED");
+            assertThat(stability(source, "/incoming/north/a.bin")).isEqualTo(1);
+            assertThat(stability(source, "/incoming/south/b.bin")).isEqualTo(1);
+            partial.set(false);
+            manualScan(listener);
+            assertThat(stability(source, "/incoming/north/a.bin")).isZero();
+            assertThat(stability(source, "/incoming/south/b.bin")).isEqualTo(2);
+            Files.writeString(north.resolve("a.bin"), "new content size");
+            clock.advance(30); manualScan(listener);
+            assertThat(stability(source, "/incoming/north/a.bin")).isEqualTo(1);
+            assertThat(stability(source, "/incoming/south/b.bin")).isEqualTo(3);
+            assertThat(listenerTasks(listener)).isEmpty();
+            clock.advance(60); manualScan(listener);
+            assertThat(listenerTasks(listener)).hasSize(1); // Only south has reached 120 seconds.
+            assertThat(listenerTasks(listener).get(0)).isNotBlank();
+            clock.advance(60); manualScan(listener);
+            assertThat(latest(listener).get("created_count")).isEqualTo(1);
+        }
+    }
+
+    @Test void baselineSurvivesAnExpiredClaimAndNamePeriodAndScopeChanges() throws Exception {
+        clock.time.set(Instant.now());
+        Path area = Files.createDirectories(remoteRoot.resolve("incoming"));
+        Files.createDirectories(area.resolve("archive"));
+        Files.writeString(area.resolve("a.bin"), "old");
+        try (ProtocolServers ftp = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            String source = source(ftp, EndpointRevision.Protocol.FTP, "FILE", "incoming");
+            configured(source).setScanDepth(1);
+            configured(source).setMinimumObservationSeconds(0);
+            String listener = listener(source, 60, "BASELINE_ONLY");
+            var config = listeners.form(listener);
+            String endpoint = (String) config.get("endpoint_id");
+            AtomicBoolean interruptedInventory = new AtomicBoolean(true);
+            doAnswer(call -> {
+                RemoteFileClient real = (RemoteFileClient) call.callRealMethod();
+                RemoteFileClient remote = mock(RemoteFileClient.class, org.mockito.AdditionalAnswers.delegatesTo(real));
+                doAnswer(list -> {
+                    if (interruptedInventory.get()) throw new java.io.IOException("TEST_BASELINE_INTERRUPTED");
+                    return real.list("/incoming");
+                }).when(remote).list("/incoming");
+                return remote;
+            }).when(clients).connect(any());
+            assertThat(manualScan(listener).get("status")).isEqualTo("FAILED");
+            assertThat(listeners.form(listener).get("initialized_at")).isNull();
+            assertThat(count("pull_listener_baseline", "listener_id", listener)).isZero();
+            interruptedInventory.set(false);
+            String abandoned = UUID.randomUUID().toString();
+            var expired = java.sql.Timestamp.from(clock.instant().minusSeconds(180));
+            db.update("INSERT INTO pull_listener_run(id,listener_id,revision,endpoint_revision_id,trigger_type,status,started_at,heartbeat_at) "
+                    + "VALUES (?,?,1,?,'SCHEDULE','SCANNING',?,?)", abandoned, listener, endpoints.current(endpoint).id, expired, expired);
+            assertThat(config.get("initialized_at")).isNull();
+            clock.advance(1);
+            PullListenerScanner restarted = new PullListenerScanner(store, listeners, pullSettings, pulls, tasks, clients, manager, clock, true, 2, 1);
+            try {
+                restarted.poll();
+                await(() -> "BASELINED".equals(latest(listener).get("status")));
+            } finally { restarted.close(); }
+            assertThat(db.queryForObject("SELECT status FROM pull_listener_run WHERE id=?", String.class, abandoned)).isEqualTo("INTERRUPTED");
+            assertThat(count("pull_listener_baseline", "listener_id", listener)).isEqualTo(1);
+            assertThat(listenerTasks(listener)).isEmpty();
+            var initialized = listeners.form(listener).get("initialized_at");
+            assertThat(initialized).isNotNull();
+            clock.advance(1);
+            listeners.save(listener, 1, "renamed", source, "incoming", 120, "BASELINE_ONLY", false);
+            listeners.toggle(listener, 2);
+            assertThat(manualScan(listener).get("created_count")).isEqualTo(0);
+            assertThat(listeners.form(listener).get("enabled")).isEqualTo(false);
+            assertThat(listeners.form(listener).get("revision")).isEqualTo(1);
+            assertThat(listeners.form(listener).get("initialized_at")).isEqualTo(initialized);
+            String baselineApi = listenerRequest(listener, endpoint, "incoming/a.bin");
+            runOnce(baselineApi, pulls);
+            assertThat(state(baselineApi)).isEqualTo("NO_NEW_DATA");
+            String separateSource = sourceOn(endpoint, "FILE", "incoming/a.bin");
+            configured(separateSource).setRecipientId("other");
+            configured(separateSource).setMinimumObservationSeconds(0);
+            String separateListener = listener(separateSource, 60, "IMPORT_EXISTING");
+            assertThat(manualScan(separateListener).get("created_count")).isEqualTo(1);
+            assertConflict(() -> listeners.save(listener, 3, "renamed", source, "incoming/archive", 120, "BASELINE_ONLY", false));
+            listeners.save(listener, 3, "renamed", source, "incoming/archive", 120, "BASELINE_ONLY", true);
+            assertThat(listeners.form(listener).get("revision")).isEqualTo(2);
+            assertThat(listeners.form(listener).get("source_id")).isEqualTo(source);
+            Files.writeString(area.resolve("archive/new.bin"), "new version");
+            assertThat(manualScan(listener).get("created_count")).isEqualTo(1);
+            assertThat(listeners.form(listener).get("initialized_at")).isEqualTo(initialized);
+            endpoints.toggle(endpoint, 1);
+            assertThatThrownBy(() -> listeners.manual(listener)).hasMessageContaining("ENDPOINT_DISABLED");
+            assertThatThrownBy(() -> listenerRequest(listener, endpoint, null)).hasMessageContaining("ENDPOINT_DISABLED");
+        }
+    }
+
+    @Test void overlappingListenersAndApiShareActualDownloadAcrossSourceAliases() throws Exception {
+        clock.time.set(Instant.now());
+        Files.createDirectories(remoteRoot.resolve("incoming"));
+        Files.writeString(remoteRoot.resolve("incoming/a.bin"), "payload across entrances");
+        try (ProtocolServers ftp = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            String folder = source(ftp, EndpointRevision.Protocol.FTP, "FILE", "incoming");
+            String endpoint = configured(folder).getEndpointId();
+            configured(folder).setScanDepth(1);
+            configured(folder).setFilePattern("*.bin");
+            configured(folder).setMinimumObservationSeconds(0);
+            String file = sourceOn(endpoint, "FILE", "incoming/a.bin");
+            configured(file).setMinimumObservationSeconds(0);
+            String consumer = sourceOn(endpoint, "FILE", "incoming/a.bin");
+            configured(consumer).setRecipientId("other");
+            configured(consumer).setMinimumObservationSeconds(0);
+            String primary = listener(folder, 60, "IMPORT_EXISTING");
+            String overlap = listener(file, 60, "IMPORT_EXISTING");
+            String separate = listener(consumer, 60, "IMPORT_EXISTING");
+            listeners.toggle(overlap, 1); listeners.toggle(separate, 1);
+            String apiTask = listenerRequest(primary, endpoint, "incoming/a.bin");
+            assertThat(tasks.get("pull", apiTask).triggerType).isEqualTo("API");
+            assertThat(tasks.get("pull", apiTask).listenerId).isEqualTo(primary);
+            assertThatThrownBy(() -> listenerRequest(primary, endpoint, "incoming-sibling/a.bin")).hasMessageContaining("LISTENER_SCOPE_MISMATCH");
+            assertThatThrownBy(() -> listenerRequest(primary, endpoint, "incoming/a.txt")).hasMessageContaining("LISTENER_SCOPE_MISMATCH");
+            mvc.perform(post("/api/transfers/tasks").header("Authorization", "Bearer other-test-token").contentType("application/json")
+                    .content(listenerJson(primary, endpoint, null).toString())).andExpect(status().isForbidden());
+
+            AtomicInteger reads = new AtomicInteger();
+            CountDownLatch entered = new CountDownLatch(1), compete = new CountDownLatch(1);
+            doAnswer(call -> {
+                RemoteFileClient real = (RemoteFileClient) call.callRealMethod();
+                RemoteFileClient remote = mock(RemoteFileClient.class, org.mockito.AdditionalAnswers.delegatesTo(real));
+                doAnswer(stat -> {
+                    if (!Thread.currentThread().getName().equals("pull-listener-scan") && entered.getCount() > 0) {
+                        entered.countDown();
+                        if (!compete.await(10, TimeUnit.SECONDS)) throw new java.io.IOException("TEST_RACE_TIMEOUT");
+                    }
+                    return real.lstat("/incoming/a.bin");
+                }).when(remote).lstat("/incoming/a.bin");
+                doAnswer(read -> {
+                    reads.incrementAndGet(); real.read(read.getArgument(0), read.getArgument(1)); return null;
+                }).when(remote).read(eq("/incoming/a.bin"), any());
+                return remote;
+            }).when(clients).connect(any());
+            CompletableFuture<Void> api = CompletableFuture.runAsync(() -> uncheckedRun(apiTask, pulls));
+            try {
+                assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+                listeners.manual(primary);
+                clock.advance(1);
+                db.update("UPDATE pull_listener SET next_run_at=? WHERE id=?", java.sql.Timestamp.from(clock.instant().minusSeconds(2)), primary);
+                pollListeners();
+            } finally { compete.countDown(); }
+            api.get(20, TimeUnit.SECONDS);
+            await(() -> "SUCCEEDED".equals(latest(primary).get("status")));
+            String shared = transferId(apiTask);
+            if (shared == null) {
+                runOnce(apiTask, pulls);
+                shared = transferId(apiTask);
+            }
+            assertThat(shared).isNotBlank();
+            assertThat(count("pull_transfer", "endpoint_id", endpoint)).isEqualTo(1);
+            assertThat(reads).hasValue(1);
+            assertThat(listenerTasks(primary)).hasSize(1);
+            String canonicalKey = db.queryForObject("SELECT delivery_key FROM pull_transfer WHERE id=?", String.class, shared);
+            String legacyKey = "a".repeat(64);
+            db.update("INSERT INTO pull_delivery_key(delivery_key,current_transfer_id) VALUES (?,?)", legacyKey, shared);
+            db.update("UPDATE pull_transfer SET delivery_key=? WHERE id=?", legacyKey, shared);
+            db.update("DELETE FROM pull_delivery_key WHERE delivery_key=?", canonicalKey);
+            assertThat(manualScan(overlap).get("reused_count")).isEqualTo(1);
+            assertThat(listenerTasks(overlap)).isEqualTo(listenerTasks(primary));
+            assertThat(db.queryForObject("SELECT current_transfer_id FROM pull_delivery_key WHERE delivery_key=?", String.class, canonicalKey)).isEqualTo(shared);
+            assertThat(manualScan(separate).get("created_count")).isEqualTo(1);
+            runOnce(listenerTasks(separate).get(0), pulls, "other");
+            assertThat(count("pull_transfer", "endpoint_id", endpoint)).isEqualTo(2);
+            assertThat(reads).hasValue(2);
+
+            var page = mvc.perform(get("/config/listeners")).andExpect(status().isOk()).andReturn();
+            assertThat(page.getResponse().getContentAsString(java.nio.charset.StandardCharsets.UTF_8)).contains("拉取监听", "运行记录");
+            mvc.perform(get("/config/listeners/new")).andExpect(status().isOk());
+            mvc.perform(get("/config/listeners/" + primary)).andExpect(status().isOk());
+            mvc.perform(get("/config/listeners/" + primary + "/runs")).andExpect(status().isOk());
+            mvc.perform(get("/config/listeners/" + primary + "/runs/" + latest(primary).get("id") + "/tasks")).andExpect(status().isOk());
+            mvc.perform(post("/config/listeners/" + primary + "/run")).andExpect(status().isForbidden());
+            var session = (org.springframework.mock.web.MockHttpSession) page.getRequest().getSession(false);
+            String csrf = (String) session.getAttribute(com.siwei.web.EndpointCsrfFilter.TOKEN);
+            mvc.perform(post("/config/listeners/" + primary + "/toggle").session(session).param("_csrf", csrf)
+                    .param("editVersion", "1")).andExpect(redirectedUrl("/config/listeners"));
+            mvc.perform(post("/config/listeners/" + primary + "/run").session(session).param("_csrf", csrf))
+                    .andExpect(redirectedUrl("/config/listeners/" + primary + "/runs"));
+            assertThat(listeners.form(primary)).containsEntry("enabled", false).containsEntry("manual_pending", true);
+        }
+    }
+
+    @Test void aLiveLargeDownloadLeavesScansAndQueuedEndpointWorkIndependent() throws Exception {
+        clock.time.set(Instant.now());
+        Path ftpRoot = Files.createDirectories(remoteRoot.resolve("ftp"));
+        Files.write(ftpRoot.resolve("large.bin"), new byte[16 * 1024 * 1024]);
+        Files.writeString(ftpRoot.resolve("small.bin"), "queued");
+        try (ProtocolServers ftp = new ProtocolServers(ftpRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL);
+             ProtocolServers sftp = new ProtocolServers(remoteRoot.resolve("sftp"), EndpointRevision.Protocol.SFTP, ProtocolServers.Mode.NORMAL)) {
+            String large = source(ftp, EndpointRevision.Protocol.FTP, "FILE", "large.bin");
+            String endpoint = configured(large).getEndpointId();
+            EndpointForm form = endpoints.form(endpoint); form.concurrency = 1;
+            endpoints.save(endpoint, form);
+            String small = sourceOn(endpoint, "FILE", "small.bin");
+            String remote = source(sftp, EndpointRevision.Protocol.SFTP, "FILE", "sample.bin");
+            for (String source : List.of(large, small, remote)) configured(source).setMinimumObservationSeconds(0);
+            String primary = listener(large, 90, "IMPORT_EXISTING");
+            manualScan(primary);
+            String downloading = listenerTasks(primary).get(0);
+            CountDownLatch bytesArrived = new CountDownLatch(1), resume = new CountDownLatch(1);
+            doAnswer(call -> {
+                RemoteFileClient real = (RemoteFileClient) call.callRealMethod();
+                if (!endpoint.equals(call.<EndpointRevision>getArgument(0).endpointId)) return real;
+                RemoteFileClient client = mock(RemoteFileClient.class, org.mockito.AdditionalAnswers.delegatesTo(real));
+                doAnswer(read -> {
+                    java.io.OutputStream output = read.getArgument(1);
+                    real.read("/large.bin", new java.io.FilterOutputStream(output) {
+                        @Override public void write(byte[] bytes, int offset, int length) throws java.io.IOException {
+                            if (bytesArrived.getCount() > 0) {
+                                bytesArrived.countDown();
+                                try {
+                                    if (!resume.await(10, TimeUnit.SECONDS)) throw new java.io.IOException("TEST_DOWNLOAD_TIMEOUT");
+                                } catch (InterruptedException error) {
+                                    Thread.currentThread().interrupt();
+                                    throw new java.io.IOException(error);
+                                }
+                            }
+                            out.write(bytes, offset, length);
+                        }
+                    });
+                    return null;
+                }).when(client).read(eq("/large.bin"), any());
+                return client;
+            }).when(clients).connect(any());
+            CompletableFuture<Void> transfer = CompletableFuture.runAsync(() -> uncheckedRun(downloading, pulls));
+            String queued;
+            try {
+                assertThat(bytesArrived.await(10, TimeUnit.SECONDS)).isTrue();
+                String sibling = listener(small, 60, "IMPORT_EXISTING");
+                String other = listener(remote, 60, "IMPORT_EXISTING");
+                manualScan(sibling);
+                queued = listenerTasks(sibling).get(0);
+                assertThat(taskDb.claimTask(queued, UUID.randomUUID().toString())).isZero();
+                assertThat(state(queued)).isEqualTo("QUEUED");
+                manualScan(other);
+                runOnce(listenerTasks(other).get(0), pulls);
+                assertThat(state(listenerTasks(other).get(0))).isEqualTo("WAITING_ACCEPTANCE");
+                assertThat(state(downloading)).isEqualTo("RUNNING");
+            } finally { resume.countDown(); }
+            transfer.get(20, TimeUnit.SECONDS);
+            runOnce(queued, pulls);
+            assertThat(state(queued)).isEqualTo("WAITING_ACCEPTANCE");
+            assertThat(Files.size(pending(transferId(downloading)).resolve("large.bin"))).isEqualTo(16L * 1024 * 1024);
+        }
+    }
+
+    @Test void incompatibleRulesRequireAnExplicitScopeChangeAndFailedDeliveriesKeepTheirTask() throws Exception {
+        clock.time.set(Instant.now());
+        Files.createDirectories(remoteRoot.resolve("incoming"));
+        Files.writeString(remoteRoot.resolve("incoming/a.bin"), "actual content");
+        Files.writeString(remoteRoot.resolve("incoming/a.bin._manifest.json"),
+                "{\"version\":\"1\",\"files\":{\"a.bin\":\"" + "0".repeat(64) + "\"}}");
+        try (ProtocolServers ftp = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
+            String manifest = source(ftp, EndpointRevision.Protocol.FTP, "FILE", "incoming/a.bin");
+            var source = configured(manifest);
+            source.setManifestName("_manifest.json"); source.setValidation("HASH");
+            String listener = listener(manifest, 60, "IMPORT_EXISTING");
+            String incompatible = sourceOn(source.getEndpointId(), "FILE", "incoming");
+            configured(incompatible).setScanDepth(1);
+            configured(incompatible).setValidation("HASH");
+            configured(incompatible).setManifestName("_different.json");
+            assertThatThrownBy(() -> listener(incompatible, 60, "IMPORT_EXISTING")).hasMessageContaining("OVERLAPPING_VERSION_RULES");
+            pullSettings.getSources().remove(incompatible);
+            manualScan(listener);
+            String task = listenerTasks(listener).get(0);
+            runOnce(task, pulls);
+            assertThat(state(task)).isEqualTo("FAILED");
+            assertThat(manualScan(listener).get("reused_count")).isEqualTo(1);
+            assertThat(listenerTasks(listener)).containsExactly(task);
+            assertThat(count("pull_transfer", "endpoint_id", source.getEndpointId())).isEqualTo(1);
+        }
+    }
 
     @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
     void filePullIsTechnicallyPassedButOnlyReceiptCompletesTask(EndpointRevision.Protocol protocol) throws Exception {
@@ -116,7 +514,8 @@ class PullIT {
             assertThat(file.get("totalFiles")).isEqualTo(1L);
             assertThat(db.queryForObject("SELECT expected_hash FROM pull_file WHERE transfer_id=?", String.class, id)).isNull();
             assertThat(db.queryForObject("SELECT version_strength FROM pull_transfer WHERE id=?", String.class, id)).isEqualTo("WEAK");
-            assertThat(db.queryForObject("SELECT count(*) FROM information_schema.tables WHERE table_schema=? AND table_name LIKE '%listener%'", Integer.class, SCHEMA)).isZero();
+            assertThat(db.queryForObject("SELECT count(*) FROM pull_listener_revision WHERE endpoint_id=?", Integer.class,
+                    pullSettings.getSources().get(source).getEndpointId())).isZero();
             JsonNode notice = notice(id);
             assertThat(notice.path("validationLevel").asText()).isEqualTo("BASIC");
             assertThat(notice.path("dataLocation").asText()).startsWith("https://business.example/data/pending/");
@@ -231,7 +630,7 @@ class PullIT {
                 }).when(remote).read(anyString(), any());
                 return remote;
             });
-            PullProcessor changingPull = new PullProcessor(store, taskDb, json, revisions, changing, transferSettings, manager);
+            PullProcessor changingPull = new PullProcessor(store, taskDb, json, revisions, changing, transferSettings, manager, clock);
             runOnce(task, changingPull);
             String old = db.queryForObject("SELECT id FROM pull_transfer WHERE owner_task_id=?", String.class, task);
             assertThat(state(task)).isEqualTo("WAITING_SOURCE");
@@ -255,7 +654,7 @@ class PullIT {
                 doAnswer(read -> { reads.incrementAndGet(); actual.read(read.getArgument(0), read.getArgument(1)); return null; }).when(remote).read(anyString(), any());
                 return remote;
             });
-            PullProcessor processor = new PullProcessor(store, taskDb, json, revisions, counting, transferSettings, manager);
+            PullProcessor processor = new PullProcessor(store, taskDb, json, revisions, counting, transferSettings, manager, clock);
             ExecutorService pool = Executors.newFixedThreadPool(2);
             try {
                 Future<?> a = pool.submit(() -> uncheckedRun(first, processor)), b = pool.submit(() -> uncheckedRun(second, processor));
@@ -290,7 +689,7 @@ class PullIT {
                 }).when(remote).read(anyString(), any());
                 return remote;
             });
-            runOnce(task, new PullProcessor(store, taskDb, json, revisions, changing, transferSettings, manager));
+            runOnce(task, new PullProcessor(store, taskDb, json, revisions, changing, transferSettings, manager, clock));
             String old = db.queryForObject("SELECT id FROM pull_transfer WHERE owner_task_id=?", String.class, task);
             assertThat(db.queryForObject("SELECT status FROM pull_transfer WHERE id=?", String.class, old)).isEqualTo("SOURCE_CHANGED");
             runOnce(task, pulls); String current = transferId(task);
@@ -427,7 +826,7 @@ class PullIT {
             assertThat(count("transfer_notification", "task_id", task)).isZero();
             RemoteFileClientFactory counting = mock(RemoteFileClientFactory.class);
             when(counting.connect(any())).thenThrow(new java.io.IOException("OFFLINE"));
-            PullProcessor recovery = new PullProcessor(store, taskDb, json, revisions, counting, transferSettings, manager);
+            PullProcessor recovery = new PullProcessor(store, taskDb, json, revisions, counting, transferSettings, manager, clock);
             db.update("UPDATE pull_transfer SET next_run_at=now() WHERE id=?", id);
             runOnce(task, recovery);
             assertThat(state(task)).isEqualTo("WAITING_ACCEPTANCE"); assertThat(notice(id).path("dataLocation").asText()).contains(id);
@@ -446,7 +845,7 @@ class PullIT {
                 doAnswer(read -> { reads.incrementAndGet(); throw new java.io.IOException("NETWORK_INTERRUPTED"); }).when(remote).read(anyString(), any());
                 return remote;
             });
-            PullProcessor processor = new PullProcessor(store, taskDb, json, revisions, failing, transferSettings, manager);
+            PullProcessor processor = new PullProcessor(store, taskDb, json, revisions, failing, transferSettings, manager, clock);
             String id = null;
             for (int i = 0; i < 4; i++) {
                 runOnce(task, processor); String current = transferId(task);
@@ -494,7 +893,7 @@ class PullIT {
                 RemoteFileClient remote = mock(RemoteFileClient.class, org.mockito.AdditionalAnswers.delegatesTo(actual));
                 doThrow(new java.io.IOException("INCOMPLETE_SCAN")).when(remote).list("/partial/nested"); return remote;
             });
-            runOnce(task, new PullProcessor(store, taskDb, json, revisions, failing, transferSettings, manager));
+            runOnce(task, new PullProcessor(store, taskDb, json, revisions, failing, transferSettings, manager, clock));
             assertThat(db.queryForObject("SELECT stable_count FROM pull_candidate WHERE source_id=?", Integer.class, source)).isEqualTo(1);
             runOnce(task, pulls);
             assertThat(db.queryForObject("SELECT stable_count FROM pull_candidate WHERE source_id=?", Integer.class, source)).isEqualTo(2);
@@ -526,11 +925,55 @@ class PullIT {
         String endpoint = endpoints.save(null, form);
         transferSettings.getCallers().get("pull").getEndpointIds().add(endpoint);
         transferSettings.getCallers().get("other").getEndpointIds().add(endpoint);
+        return sourceOn(endpoint, type, path);
+    }
+    private String sourceOn(String endpoint, String type, String path) {
         String id = "source-" + UUID.randomUUID(); PullSettings.Source source = new PullSettings.Source();
         source.setEndpointId(endpoint); source.setSourcePath(path); source.setTargetRef("delivery");
         source.setUnitType(type); source.setRecipientId("pull"); source.setCallerIds(Set.of("pull"));
         source.setAccessBase("https://business.example/data"); source.setStableObservations(1); source.setObservationSeconds(3600);
         pullSettings.getSources().put(id, source); return id;
+    }
+    private PullSettings.Source configured(String source) { return pullSettings.getSources().get(source); }
+    private String listener(String source, int period, String mode) {
+        return listeners.save(null, 0, source, source, configured(source).getSourcePath(), period, mode, false);
+    }
+    private ObjectNode listenerJson(String listener, String endpoint, String path) {
+        var request = json.createObjectNode().put("taskId", UUID.randomUUID().toString()).put("direction", "PULL")
+                .put("endpointId", endpoint).put("listenerId", listener);
+        if (path != null) request.put("sourcePath", path);
+        return request;
+    }
+    private String listenerRequest(String listener, String endpoint, String path) {
+        var request = listenerJson(listener, endpoint, path);
+        return tasks.accept("pull", request, request.toString(), "JSON").taskRecordId;
+    }
+    private void pollListeners() {
+        doCallRealMethod().when(scanner).poll();
+        try { scanner.poll(); } finally { doNothing().when(scanner).poll(); }
+    }
+    private Map<String, Object> latest(String listener) {
+        return db.queryForList("SELECT * FROM pull_listener_run WHERE listener_id=? ORDER BY started_at DESC,id DESC LIMIT 1", listener)
+                .stream().findFirst().orElseGet(Map::of);
+    }
+    private Map<String, Object> manualScan(String listener) throws Exception {
+        Object previous = latest(listener).getOrDefault("id", "");
+        clock.time.updateAndGet(time -> time.plusMillis(5));
+        listeners.manual(listener);
+        pollListeners();
+        await(() -> {
+            var row = latest(listener);
+            if (row.isEmpty() || previous.equals(row.get("id"))) { pollListeners(); return false; }
+            return !"SCANNING".equals(row.get("status"));
+        });
+        return latest(listener);
+    }
+    private List<String> listenerTasks(String listener) {
+        return db.queryForList("SELECT task_id FROM pull_listener_run_task WHERE run_id=?", String.class, latest(listener).get("id"));
+    }
+    private int runCount(String listener) { return count("pull_listener_run", "listener_id", listener); }
+    private int stability(String source, String path) {
+        return db.queryForObject("SELECT stable_count FROM pull_candidate WHERE source_id=? AND source_path=?", Integer.class, source, path);
     }
     private String accept(String source) { return accept(source, UUID.randomUUID().toString()); }
     private String accept(String source, String external) {
@@ -540,12 +983,15 @@ class PullIT {
         return tasks.accept("pull", request, request.toString(), "JSON").taskRecordId;
     }
     private void runOnce(String task, PullProcessor processor) throws Exception {
+        runOnce(task, processor, "pull");
+    }
+    private void runOnce(String task, PullProcessor processor, String caller) throws Exception {
         db.update("UPDATE transfer_task SET next_run_at=now() WHERE id=?", task);
         String claim = UUID.randomUUID().toString();
         if (taskDb.claimTask(task, claim) != 1) {
             await(() -> !"RUNNING".equals(state(task))); return;
         }
-        processor.process(tasks.get("pull", task)); processor.finish(task, claim);
+        processor.process(tasks.get(caller, task)); processor.finish(task, claim);
     }
     private void uncheckedRun(String task, PullProcessor processor) { try { runOnce(task, processor); } catch (Exception e) { throw new RuntimeException(e); } }
     private void dispatch() {

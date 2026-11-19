@@ -1,6 +1,6 @@
 # 任务接口契约（PR-03/04/05）
 
-本页是新 JSON 接口的实施契约。PR-04 接入 PUSH，PR-05 接入单次 PULL 和验收回执。旧 XML 仍为暂定契约，默认关闭；PULL 不隐式接受旧 XML 回执。
+本页是 JSON 任务接口的实施契约。PR-04 接入 PUSH，PR-05 接入单次 PULL 和验收回执，PR-06 支持引用监听配置执行单次 PULL。旧 XML 仍为暂定契约，默认关闭。PULL 验收回执使用 JSON 接口。
 
 ## 身份与配置
 
@@ -58,7 +58,7 @@ platform:
 {"taskId":"job-001","direction":"PUSH","endpointId":"<uuid>","sourceCode":"weather","sourceRoot":"configured-local-source-ref","targetPath":"batch/001","products":[{"productId":"product-1","productPath":"products/product-1","productName":"示例产品"}]}
 ```
 
-PULL 的请求字段和验收规则由后续实现单独维护，本轮不扩展拉取契约。
+PULL 请求字段见 [来源配置](#pull-来源配置与源清单)和[用监听配置执行单次拉取](#用监听配置执行单次拉取)。
 
 新受理返回 HTTP 202：
 
@@ -142,6 +142,23 @@ PACKAGE_DIR 的清单位于 `单元路径/manifest-name`；FILE 的清单为 `�
 任务详情的 `deliveries` 逐单元返回 `transfer_id`、`source_version`、版本依据与强弱、技术状态、验收状态、原因、位置及超时提醒时间。文件分页返回 `transfer_id`、`relative_path`、`size_bytes`、`downloaded_bytes`、`expected_hash`、`actual_hash`、`verified`。待就绪单元使整单总量保持未知，但已冻结单元仍可分页查询。`downloadedBytes` 与 `verifiedBytes` 分开；按整文件持久化，不提供文件流内实时百分比。
 
 交付唯一键包含 endpoint、规范源路径、单元规则、版本依据/值、稳定落地根/映射、接收方及校验等级。新 API taskId 命中相同交付时建立关联并复用，普通内部重试、通知补发和业务拒绝均不创建新一轮。不同接收方、落地目标或校验要求独立交付。范围首次完整扫描固定本次单元范围，后续只复查这些单元；空范围记录 `NO_NEW_DATA`，没有 transferId 或假验收通知。
+
+### 用监听配置执行单次拉取
+
+向 `POST /api/transfers/tasks` 提交以下请求。
+
+```json
+{
+  "taskId": "pull-once-123",
+  "direction": "PULL",
+  "endpointId": "已授权的连接 ID",
+  "listenerId": "监听 ID"
+}
+```
+
+调用方须获同一连接和来源授权。省略 `sourcePath` 时使用监听范围。可提供更窄的相对路径，缩小扫描树并保留原单元层级和匹配规则。`sourceId` 和 `targetPath` 可省略，提供时须与监听配置一致。API 可引用已停用的监听，连接须保持启用。任务命中已登记的基线版本时，该单元跳过交付。没有其他单元时任务返回 `NO_NEW_DATA`。
+
+任务查询返回 `triggerType`（`API`、`MANUAL`、`SCHEDULE`）、`listenerId` 和 `listenerRevision`。监听管理页按运行记录列出新建或复用的任务。文件匹配表达式用于发现单元。只要实际单元边界、规范路径、版本依据和交付范围一致，重叠的匹配规则共享同一交付。版本依据或单元边界无法安全对齐时，保存或受理返回范围冲突。
 
 下载中源属性/集合变化会终止旧基准轮次、清零稳定观察并返回候选阶段。重新满足就绪条件后使用新 transferId；强清单版本未变化但观察基准已失效时，同样保留旧轮次历史后切换新轮次。该行为仅用于已记录的 `SOURCE_CHANGED`，不用于普通网络重试、通知补发或业务拒绝。
 

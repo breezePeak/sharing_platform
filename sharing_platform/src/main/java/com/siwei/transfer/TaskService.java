@@ -16,7 +16,7 @@ import org.w3c.dom.*;
 
 @Service
 public class TaskService {
-    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products", "fileCount");
+    private static final Set<String> FIELDS = Set.of("taskId", "direction", "endpointId", "sourceId", "sourceCode", "sourceRoot", "sourcePath", "targetPath", "products", "fileCount", "listenerId");
     private final ObjectMapper json;
     private final TransferJpa db;
     private final TransferTaskRepository taskRecords;
@@ -30,18 +30,20 @@ public class TaskService {
     private final List<TaskProcessor> processors;
     private final PullSettings pulls;
     private final PullStore pullStore;
+    private final PullListenerService listeners;
 
     public TaskService(ObjectMapper json, TransferJpa db, TransferTaskRepository taskRecords,
                        TransferProductRepository productRecords, TransferNotificationRepository notificationRecords,
                        org.springframework.transaction.PlatformTransactionManager transactionManager,
                        TransferSettings settings, EndpointRepository endpoints, EndpointRevisionRepository revisions,
                        EndpointSettings endpointSettings,
-                       List<TaskProcessor> processors, PullSettings pulls, PullStore pullStore) {
+                       List<TaskProcessor> processors, PullSettings pulls, PullStore pullStore, PullListenerService listeners) {
         this.json = json; this.db = db; this.taskRecords = taskRecords; this.productRecords = productRecords;
         this.notificationRecords = notificationRecords; this.tx = new TransactionTemplate(transactionManager);
         this.settings = settings; this.endpoints = endpoints; this.revisions = revisions;
         this.endpointSettings = endpointSettings; this.processors = processors;
         this.pulls = pulls; this.pullStore = pullStore;
+        this.listeners = listeners;
     }
 
     public String authenticate(String authorization) {
@@ -126,6 +128,7 @@ public class TaskService {
         if (!taskId.matches("[A-Za-z0-9][A-Za-z0-9._-]{0,99}")) throw invalid();
         String direction = required(input, "direction", 4);
         if (!direction.equals("PUSH") && !direction.equals("PULL")) throw invalid();
+        if (input.has("listenerId") && (!direction.equals("PULL") || !input.path("listenerId").isTextual())) throw invalid();
         for (Iterator<String> fields = input.fieldNames(); fields.hasNext();) {
             String field = fields.next();
             if (!FIELDS.contains(field) && !(entry.equals("XML") && field.equals("type"))) throw invalid();
@@ -166,7 +169,11 @@ public class TaskService {
             Endpoint endpoint = endpoints.lockById(endpointId).orElseThrow(() -> error(HttpStatus.BAD_REQUEST, "ENDPOINT_NOT_FOUND"));
             if (!endpoint.enabled) throw error(HttpStatus.BAD_REQUEST, "ENDPOINT_DISABLED");
             EndpointRevision revision = revisions.findByEndpointIdAndRevision(endpointId, endpoint.revision).orElseThrow();
-            try { validateScope(input, direction, revision, route); }
+            ObjectNode listener = input.has("listenerId") ? listeners.resolveApi(input, caller, revision) : null;
+            ObjectNode effective = input;
+            if (listener != null) effective = input.deepCopy().put("sourceId", listener.path("sourceId").asText())
+                    .put("sourcePath", listener.path("requestPath").asText()).put("targetPath", listener.path("targetRef").asText());
+            try { validateScope(effective, direction, revision, route); }
             catch (IllegalArgumentException e) { throw invalid(); }
             String sourceRoot = null;
             if (direction.equals("PUSH")) try {
@@ -196,8 +203,19 @@ public class TaskService {
                     productRecords.save(record);
                 }
             }
-            if (count == 1 && direction.equals("PULL")) pullStore.snapshot(id, required(input, "sourceId", 100),
-                    pulls.snapshot(json, input, revision, caller, endpointSettings, settings));
+            if (count == 1 && direction.equals("PULL")) {
+                String source = required(effective, "sourceId", 100);
+                if (listener == null) {
+                    String snapshot = pulls.snapshot(json, effective, revision, caller, endpointSettings, settings);
+                    listeners.rejectConflictingListeners(null, endpointId, required(effective, "sourcePath", 1000), parseJson(snapshot));
+                    pullStore.snapshot(id, source, snapshot);
+                } else {
+                    int listenerRevision = listener.remove("listenerRevision").asInt();
+                    pullStore.snapshot(id, source, listener.toString());
+                    pullStore.update("UPDATE transfer_task SET listener_id=?,listener_revision=? WHERE id=?",
+                            required(input, "listenerId", 36), listenerRevision, id);
+                }
+            }
             return count;
         });
         if (inserted == 0) {
@@ -206,6 +224,23 @@ public class TaskService {
             return compare(winner, canonical);
         }
         return new Accepted(id, taskId, true, false, "QUEUED");
+    }
+
+    String acceptScanned(String listenerId, int listenerRevision, String trigger, String scope,
+                         JsonNode config, EndpointRevision endpoint) {
+        String id = UUID.randomUUID().toString();
+        String source = config.path("sourceId").asText();
+        ObjectNode input = json.createObjectNode().put("taskId", id).put("direction", "PULL")
+                .put("endpointId", endpoint.endpointId).put("listenerId", listenerId).put("sourceId", source)
+                .put("sourcePath", scope).put("targetPath", config.path("targetRef").asText());
+        if (db.insertTask(id, config.path("recipientId").asText(), id, "JSON", "PULL", endpoint.endpointId,
+                endpoint.id, config.path("notificationUrl").asText(), canonical(input, endpoint.endpointId),
+                input.toString(), null, java.sql.Timestamp.from(Instant.now())) != 1)
+            throw new IllegalStateException("SCAN_TASK_CONFLICT");
+        pullStore.snapshot(id, source, config.toString());
+        pullStore.update("UPDATE transfer_task SET pull_scan_complete=true,trigger_type=?,listener_id=?,listener_revision=? WHERE id=?",
+                trigger, listenerId, listenerRevision, id);
+        return id;
     }
 
     private Accepted compare(Task task, String canonical) {
@@ -221,7 +256,7 @@ public class TaskService {
             if (!code.matches("[A-Za-z0-9][A-Za-z0-9._-]{0,99}")) throw invalid();
             value.put("sourceCode", code);
         }
-        for (String field : List.of("sourceId", "sourceRoot", "sourcePath", "targetPath")) {
+        for (String field : List.of("sourceId", "sourceRoot", "sourcePath", "targetPath", "listenerId")) {
             JsonNode node = input.get(field);
             if (node != null && !node.isNull()) value.put(field, required(input, field, 1000));
         }
@@ -342,6 +377,7 @@ public class TaskService {
         Task t = new Task(); t.taskRecordId = row.id; t.callerId = row.callerId;
         t.taskId = row.externalTaskId; t.entryType = row.entryType; t.direction = row.direction;
         t.endpointId = row.endpointId; t.endpointRevisionId = row.endpointRevisionId;
+        t.triggerType = row.triggerType; t.listenerId = row.listenerId; t.listenerRevision = row.listenerRevision;
         t.claimId = row.claimId;
         t.canonicalRequest = row.canonicalRequest; t.executionStatus = row.status; t.phase = row.phase;
         t.acceptanceStatus = row.acceptanceStatus; t.errorType = row.errorType;

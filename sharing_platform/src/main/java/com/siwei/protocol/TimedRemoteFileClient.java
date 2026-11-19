@@ -31,6 +31,9 @@ final class TimedRemoteFileClient implements RemoteFileClient {
             T result = action.run();
             synchronized (this) { if (closed) throw new IOException("NO_PROGRESS_TIMEOUT"); }
             return result;
+        } catch (RuntimeException error) {
+            synchronized (this) { if (closed) throw new IOException("NO_PROGRESS_TIMEOUT", error); }
+            throw error;
         } finally { synchronized (this) { running[0] = false; deadline.cancel(false); } }
     }
     @Override public List<Entry> list(String path) throws IOException { return io(() -> client.list(path)); }

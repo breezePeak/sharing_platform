@@ -17,20 +17,30 @@ public class PullSettings {
     public String snapshot(com.fasterxml.jackson.databind.ObjectMapper json, com.fasterxml.jackson.databind.JsonNode request,
                            com.siwei.endpoint.EndpointRevision endpoint, String caller,
                            com.siwei.endpoint.EndpointSettings roots, TransferSettings transfers) {
+        String id = TaskService.required(request, "sourceId", 100);
+        Source source = sources.get(id);
+        if (source == null || !source.callerIds.contains(caller))
+            throw TaskService.error(org.springframework.http.HttpStatus.FORBIDDEN, "SOURCE_FORBIDDEN");
+        String target = TaskService.required(request, "targetPath", 100);
+        if (!target.equals(source.targetRef))
+            throw TaskService.error(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_PULL_CONFIG");
+        return configuredSnapshot(json, id, TaskService.required(request, "sourcePath", 1000), endpoint, roots, transfers).toString();
+    }
+
+    com.fasterxml.jackson.databind.node.ObjectNode configuredSnapshot(com.fasterxml.jackson.databind.ObjectMapper json,
+            String id, String path, com.siwei.endpoint.EndpointRevision endpoint,
+            com.siwei.endpoint.EndpointSettings roots, TransferSettings transfers) {
         try {
-            String id = TaskService.required(request, "sourceId", 100);
             Source source = sources.get(id);
-            if (source == null || !source.callerIds.contains(caller))
-                throw TaskService.error(org.springframework.http.HttpStatus.FORBIDDEN, "SOURCE_FORBIDDEN");
-            if (!endpoint.endpointId.equals(source.endpointId) || !Objects.equals(source.targetRef, endpoint.localTargetRef)
-                    || !source.targetRef.equals(TaskService.required(request, "targetPath", 100))) throw new IllegalArgumentException();
-            String path = TaskService.required(request, "sourcePath", 1000);
+            if (!endpoint.endpointId.equals(source.endpointId) || !Objects.equals(source.targetRef, endpoint.localTargetRef))
+                throw new IllegalArgumentException();
             com.siwei.protocol.ControlledPaths.relative(source.sourcePath);
-            com.siwei.protocol.ControlledPaths.relative(path);
-            if (!path.equals(source.sourcePath) && !path.startsWith(source.sourcePath + "/")) throw new IllegalArgumentException();
+            if (com.siwei.protocol.ControlledPaths.resolve(endpoint.readRoot, path).length() > 1000) throw new IllegalArgumentException();
+            if (!within(path, source.sourcePath)) throw new IllegalArgumentException();
             if (!Set.of("FILE", "PACKAGE_DIR").contains(source.unitType) || !Set.of("BASIC", "HASH").contains(source.validation)
                     || source.scanDepth < 0 || source.scanDepth > 8 || source.stableObservations < 1
-                    || source.observationSeconds < 1 || source.acceptanceSeconds < 1) throw new IllegalArgumentException();
+                    || source.observationSeconds < 1 || source.acceptanceSeconds < 1
+                    || (source.minimumObservationSeconds != null && source.minimumObservationSeconds < 0)) throw new IllegalArgumentException();
             java.nio.file.FileSystems.getDefault().getPathMatcher("glob:" + source.filePattern);
             for (String control : Arrays.asList(source.manifestName, source.readyName))
                 if (control != null && (!control.matches("[A-Za-z_][A-Za-z0-9._-]{0,99}") || control.startsWith(".sharing-"))) throw new IllegalArgumentException();
@@ -47,21 +57,27 @@ public class PullSettings {
                     || url.getFragment() != null) throw new IllegalArgumentException();
             var config = json.valueToTree(source);
             var result = (com.fasterxml.jackson.databind.node.ObjectNode) config;
+            result.remove("callerIds");
             result.put("sourceId", id);
             result.put("accessBase", access.normalize().toASCIIString().replaceAll("/+$", ""));
             result.put("localRoot", com.siwei.protocol.ControlledPaths.localDirectory(roots.getLocalRoots().get(source.targetRef)).toString());
             result.put("remoteRoot", endpoint.readRoot);
             result.put("notificationUrl", url.toString());
-            return result.toString();
+            return result;
         } catch (java.io.IOException | IllegalArgumentException | NullPointerException error) {
             throw TaskService.error(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_PULL_CONFIG");
         }
+    }
+
+    static boolean within(String path, String scope) {
+        return path.equals(scope) || path.startsWith(scope + "/") || scope.equals("/");
     }
 
     public static class Source {
         private String endpointId, sourcePath, targetRef, recipientId, accessBase;
         private String unitType = "FILE", validation = "BASIC", filePattern = "*", manifestName, readyName;
         private int scanDepth, stableObservations = 3, observationSeconds = 60, acceptanceSeconds = 86400;
+        private Integer minimumObservationSeconds;
         private Set<String> callerIds = new HashSet<>();
         public String getEndpointId() { return endpointId; }
         public void setEndpointId(String v) { endpointId = v; }
@@ -89,6 +105,8 @@ public class PullSettings {
         public void setStableObservations(int v) { stableObservations = v; }
         public int getObservationSeconds() { return observationSeconds; }
         public void setObservationSeconds(int v) { observationSeconds = v; }
+        public Integer getMinimumObservationSeconds() { return minimumObservationSeconds; }
+        public void setMinimumObservationSeconds(Integer v) { minimumObservationSeconds = v; }
         public int getAcceptanceSeconds() { return acceptanceSeconds; }
         public void setAcceptanceSeconds(int v) { acceptanceSeconds = v; }
         public Set<String> getCallerIds() { return callerIds; }

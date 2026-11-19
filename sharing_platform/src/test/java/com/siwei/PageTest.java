@@ -27,7 +27,7 @@ class PageTest {
     void pagesAreDirectlyAccessibleAndRenderHonestEmptyStates() throws Exception {
         for (String page : new String[] {"/services", "/tasks"}) {
             mvc.perform(get(page)).andExpect(status().isOk())
-                    .andExpect(content().string(containsString("尚未开放")))
+                    .andExpect(content().string(containsString(page.equals("/services") ? "监听配置" : "尚未开放")))
                     .andExpect(content().string(containsString("/css/app.css")))
                     .andExpect(content().string(not(containsString("/login"))));
         }

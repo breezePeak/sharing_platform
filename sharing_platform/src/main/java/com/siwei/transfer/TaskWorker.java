@@ -122,6 +122,11 @@ public class TaskWorker {
             ((PullProcessor) processors.get("PULL")).finish(task.taskRecordId, claim);
             return;
         }
+        if (task.direction.equals("PULL") && !"API".equals(task.triggerType) && result.status.equals("FAILED")) {
+            ((PullProcessor) processors.get("PULL")).failUnstartedDeliveries(task.taskRecordId, claim, result.errorType);
+            ((PullProcessor) processors.get("PULL")).finish(task.taskRecordId, claim);
+            return;
+        }
         tx.executeWithoutResult(status -> {
             int updated = db.finishTask(task.taskRecordId, claim, result);
             if (updated == 0 || result.status.equals("RECONCILING")) return;

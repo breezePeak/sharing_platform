@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>监听运行 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header">
+    <h1 th:text="${listener.name}"></h1>
+    <div class="actions">
+      <a th:if="${runs == null}" class="button button-secondary"
+         th:href="@{/config/listeners/{id}/runs(id=${listener.id})}">返回运行记录</a>
+      <a class="button button-secondary" th:href="@{/config/listeners}">返回监听列表</a>
+    </div>
+  </div>
+  <section th:if="${runs != null}">
+    <h2>最近扫描</h2>
+    <p th:if="${#lists.isEmpty(runs)}">尚无扫描记录。</p>
+    <article class="panel" th:each="run : ${runs}">
+      <h3><time th:text="${run.started_at}"></time> · <span th:text="${run.status}"></span></h3>
+      <p th:text="|${run.trigger_type} · 配置版本 ${run.revision} · ${run.source_path}|"></p>
+      <p th:if="${run.elapsed_seconds != null}" th:text="|耗时 ${run.elapsed_seconds} 秒|"></p>
+      <p th:if="${run.error_type != null}" th:text="${run.error_type}"></p>
+      <p th:if="${run.coalesced_reason != null}" th:text="${run.coalesced_reason}"></p>
+      <p th:text="|候选 ${run.candidate_count} · 等待 ${run.waiting_count} · 新版本 ${run.new_version_count} · 新建交付 ${run.created_count} · 复用交付 ${run.reused_count}|"></p>
+      <a th:if="${run.created_task_count + run.reused_task_count > 0}"
+         th:href="@{/config/listeners/{id}/runs/{run}/tasks(id=${listener.id},run=${run.id})}"
+         th:text="|关联任务（新建 ${run.created_task_count}，复用 ${run.reused_task_count}）|"></a>
+    </article>
+  </section>
+  <section>
+    <h2 th:text="${runs == null ? '扫描关联任务' : '引用本监听的 API 任务'}"></h2>
+    <p th:if="${#lists.isEmpty(tasks)}">暂无关联任务。</p>
+    <article class="panel" th:each="task : ${tasks}">
+      <h3 th:text="${task.external_task_id}"></h3>
+      <p>任务记录 <code th:text="${task.id}"></code></p>
+      <p th:text="|${task.trigger_type} · 执行 ${task.status} · 验收 ${task.acceptance_status}|"></p>
+      <p th:if="${task.error_type != null}" th:text="${task.error_type}"></p>
+    </article>
+  </section>
+</main>
+</body>
+</html>

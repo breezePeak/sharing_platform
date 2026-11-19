@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>拉取监听 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header">
+    <h1>拉取监听</h1>
+    <div class="actions">
+      <a class="button button-secondary" th:href="@{/config/endpoints}">连接配置</a>
+      <a class="button" th:href="@{/config/listeners/new}">新增监听</a>
+    </div>
+  </div>
+  <section class="empty" th:if="${#lists.isEmpty(listeners)}">
+    <h2>暂无监听</h2>
+    <p>先在外置配置中定义拉取来源，再为它添加监听目录。</p>
+  </section>
+  <article class="endpoint-card" th:each="row : ${listeners}">
+    <div class="endpoint-card-header">
+      <div>
+        <div class="endpoint-title-row">
+          <h2><a th:href="@{/config/listeners/{id}(id=${row.id})}" th:text="${row.name}"></a></h2>
+          <span th:class="${row.enabled ? 'badge badge-enabled' : 'badge badge-disabled'}"
+                th:text="${row.enabled ? '已启用' : '已停用'}"></span>
+          <span th:if="${!row.endpoint_enabled}" class="badge badge-disabled">连接已停用</span>
+        </div>
+        <p class="endpoint-meta">
+          <a th:href="@{/config/endpoints/{id}(id=${row.endpoint_id})}">连接配置</a>
+          <span>来源 <code th:text="${row.source_id}"></code></span>
+          <span>目录 <code th:text="${row.source_path}"></code></span>
+          <span th:text="|版本 ${row.revision} · 每 ${row.period_seconds} 秒|"></span>
+        </p>
+      </div>
+      <div class="actions">
+        <a class="button button-secondary" th:href="@{/config/listeners/{id}/runs(id=${row.id})}">运行记录</a>
+        <form method="post" th:action="@{/config/listeners/{id}/toggle(id=${row.id})}">
+          <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="editVersion" th:value="${row.edit_version}">
+          <button class="button-secondary" th:text="${row.enabled ? '停用' : '启用'}">停用</button>
+        </form>
+        <form method="post" th:action="@{/config/listeners/{id}/run(id=${row.id})}">
+          <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <button th:disabled="${!row.endpoint_enabled}">执行一次</button>
+        </form>
+      </div>
+    </div>
+    <div class="probe-section">
+      <p>
+        <span th:text="${row.initial_mode == 'BASELINE_ONLY' ? '首次扫描登记基线' : '导入已有数据'}"></span>
+        <span th:text="${row.initialized_at == null ? ' · 待初始化' : ' · 初始化于 ' + row.initialized_at}"></span>
+      </p>
+      <p th:if="${row.manual_pending || (row.due && row.endpoint_enabled && row.run_status != 'SCANNING')}">扫描已排队</p>
+      <p th:if="${row.enabled && row.endpoint_enabled}">计划扫描 <time th:text="${row.next_run_at}"></time></p>
+      <p th:if="${row.run_id == null}">尚无扫描记录</p>
+      <div th:if="${row.run_id != null}">
+        <p>最近扫描 <time th:text="${row.started_at}"></time> · <strong th:text="${row.run_status}"></strong></p>
+        <p th:if="${row.error_type != null}" th:text="${row.error_type}"></p>
+        <p th:if="${row.coalesced_reason != null}" th:text="${row.coalesced_reason}"></p>
+        <p th:unless="${row.run_status == 'SCANNING'}"
+           th:text="|候选 ${row.candidate_count} · 等待 ${row.waiting_count} · 新建交付 ${row.created_count} · 复用交付 ${row.reused_count}|"></p>
+      </div>
+    </div>
+  </article>
+</main>
+</body>
+</html>

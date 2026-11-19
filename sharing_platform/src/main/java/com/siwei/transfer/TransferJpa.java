@@ -45,7 +45,11 @@ public class TransferJpa {
     }
 
     public List<Map<String, Object>> dueTasks(int limit, int offset) {
-        return queryForList("SELECT id,direction FROM transfer_task WHERE (status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes') ORDER BY next_run_at,id LIMIT ? OFFSET ?", limit, offset);
+        return queryForList("SELECT id,direction FROM (SELECT id,direction,next_run_at,"
+                + "row_number() OVER (PARTITION BY endpoint_id ORDER BY next_run_at,id) AS priority FROM transfer_task "
+                + "WHERE (status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now()) "
+                + "OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes')) due "
+                + "ORDER BY priority,next_run_at,id LIMIT ? OFFSET ?", limit, offset);
     }
     public int claimTask(String id, String claim) {
         List<Map<String, Object>> candidates = queryForList("SELECT t.endpoint_id,r.concurrency FROM transfer_task t JOIN endpoint_revision r ON r.id=t.endpoint_revision_id WHERE t.id=?", id);

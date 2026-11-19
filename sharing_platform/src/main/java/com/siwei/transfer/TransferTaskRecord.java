@@ -25,6 +25,9 @@ public class TransferTaskRecord {
     @Column(name = "push_route_snapshot") public String pushRouteSnapshot;
     @Column(name = "pull_config") public String pullConfig;
     @Column(name = "pull_scan_complete") public boolean pullScanComplete;
+    @Column(name = "trigger_type") public String triggerType = "API";
+    @Column(name = "listener_id") public String listenerId;
+    @Column(name = "listener_revision") public Integer listenerRevision;
     public String status, phase;
     @Column(name = "acceptance_status") public String acceptanceStatus;
     @Column(name = "error_type") public String errorType;

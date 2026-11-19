@@ -15,7 +15,7 @@ public class EndpointCsrfFilter extends OncePerRequestFilter {
     @Override protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
         String path = org.springframework.web.util.UrlPathHelper.defaultInstance.getPathWithinApplication(request);
-        if (path.startsWith("/config/endpoints")) {
+        if (path.startsWith("/config/endpoints") || path.startsWith("/config/listeners")) {
             if (request.getMethod().equals("GET")) {
                 HttpSession session = request.getSession();
                 if (session.getAttribute(TOKEN) == null) session.setAttribute(TOKEN, UUID.randomUUID().toString());

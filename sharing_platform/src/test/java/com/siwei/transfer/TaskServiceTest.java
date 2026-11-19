@@ -30,7 +30,7 @@ class TaskServiceTest {
         caller.setXmlRoutes(Map.of("weather", "endpoint"));
         settings.setCallers(Map.of("test", caller));
         service = new TaskService(json, db, tasks, products, notifications,
-                mock(PlatformTransactionManager.class), settings, endpoints, revisions, new EndpointSettings(), List.of(), new PullSettings(), mock(PullStore.class));
+                mock(PlatformTransactionManager.class), settings, endpoints, revisions, new EndpointSettings(), List.of(), new PullSettings(), mock(PullStore.class), mock(PullListenerService.class));
     }
 
     @Test void credentialsAreServerSideAndXxeIsRejected() {
@@ -82,7 +82,7 @@ class TaskServiceTest {
         };
         TaskService stopped = new TaskService(json, db, tasks, products, notifications,
                 mock(PlatformTransactionManager.class), settings, endpoints, revisions,
-                new EndpointSettings(), List.of(processor), new PullSettings(), mock(PullStore.class));
+                new EndpointSettings(), List.of(processor), new PullSettings(), mock(PullStore.class), mock(PullListenerService.class));
         String request = "{\"taskId\":\"stopped\",\"direction\":\"PUSH\",\"endpointId\":\"endpoint\",\"sourceRoot\":\"local\",\"targetPath\":\"a\",\"products\":[{\"productId\":\"p\",\"productPath\":\"p\"}]}";
         assertThatThrownBy(() -> stopped.accept("test", stopped.parseJson(request), request, "JSON"))
                 .isInstanceOf(ResponseStatusException.class).satisfies(e -> assertThat(((ResponseStatusException) e).getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));

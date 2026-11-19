@@ -81,11 +81,11 @@ PUSH 使用现有 Bearer 调用方、endpoint 授权和通知配置。连接须�
 
 ## PR5 单次拉取
 
-PULL 使用统一任务入口，必须引用管理员配置的稳定 `sourceId`，显式选择 FILE 或 PACKAGE_DIR、扫描层级、BASIC/HASH、就绪规则、交付根和业务访问映射。来源配置及 HASH 清单格式见 [任务接口契约](doc/contracts/transfer-api.md#pull-来源配置与源清单)。一次调用只处理本次范围，不创建永久监听；缺少就绪条件时由原任务的 `nextRunAt` 重查。
+PULL 使用统一任务入口，可引用管理员配置的稳定 `sourceId` 或已登记的 `listenerId`。数据单元、扫描层级、BASIC/HASH、就绪规则、交付根和业务访问映射由来源配置决定。一次调用只处理本次范围。缺少就绪条件时由原任务的 `nextRunAt` 重查。来源配置及 HASH 清单格式见 [任务接口契约](doc/contracts/transfer-api.md#pull-来源配置与源清单)。
 
 数据在 `tmp/transferId/` 下载、校验后发布到 `pending/transferId/`；接收端只消费含有效 `.sharing-complete` 的目录。通知给出配置映射下的 `dataLocation`，需由部署方配置共享挂载或读取服务并验证业务平台确实可访问；应用不会自动暴露本机目录。下载完成后保持待验收，认证接收方调用 `POST /api/sharing/pull/confirmations` 后才决定最终结果；验收先于通知 ACK 也有效。原数据与已发布目录默认保留。
 
-新增生产迁移 `V5__pull_deliveries.sql`；已执行 V1—V4 不改写。工作区并行的 PUSH 修复使用 V6，升级测试专用迁移顺延至 V7，不进入应用 JAR。关闭新拉取设置 `platform.pulls.intake-enabled=false`，保留处理器、查询、通知及回执；不要用 `platform.pulls.enabled=false` 回退在途交付。实现与验收证据见 [PR5 实施记录](doc/pr/PR-05_实施记录.md)。
+PR5 的生产迁移为 `V5__pull_deliveries.sql`。关闭新拉取可设置 `platform.pulls.intake-enabled=false`，保留处理器、查询、通知及回执。实现与验收证据见 [PR5 实施记录](doc/pr/PR-05_实施记录.md)。
 
 PR4 审查修复后，连接的 `timeoutSeconds` 同时作为业务网络 I/O 无进展期限（1—30 秒）：上传/回读有字节进展便续期，持续传输不受固定总时长限制；过期直接关闭底层会话，进入原文件的有限重试。探测保留原总时限。`concurrency` 由稳定 endpointId 统一约束业务执行与探测，跨配置修订共享名额；并存修订采用较小限制。在途任务使用原配置，停用不切换地址或凭据；满额任务留库排队，不占 worker。不同端点可利用空闲 worker。
 
@@ -93,9 +93,41 @@ PR4 审查修复后，连接的 `timeoutSeconds` 同时作为业务网络 I/O �
 
 V6 新增精确清单字节、manifest 发布意图、路由快照和流量列。保留当前工作区既有 V5（PULL）及 V1—V4 原迁移，不清空业务表。历史 V4 清单按 Java UTF-16 字符串顺序恢复并核对原摘要；不修改数据库 collation、不重新冻结源内容。已确认归属的 manifest/READY 临时文件在严格集合检查前核对、清理并重写，其他任务或内容不符的临时文件仍阻止发布。发布不明继续 `RECONCILING`，不提前发失败完成单。详细改动与本轮真实测试见[审查修复记录](doc/pr/PR-04_审查修复记录.md)。
 
+## PR6 多目标拉取监听
+
+在外置 YAML 配好拉取来源后，打开 `/config/listeners`。选择来源、填写相对连接读取根的扫描路径，为同一 FTP/SFTP 连接配置多个独立监听。周期默认 60 秒，首次模式默认导入已有数据。选择首次基线时，仅在完整扫描后登记该监听范围的历史版本，后续版本按就绪规则拉取。编辑来源规则或目录时，页面要求确认保留历史，并按新范围扫描。部署沿用受限管理网络，公开 API 仍使用 Bearer、连接授权和来源授权。
+
+```yaml
+platform:
+  pulls:
+    listeners:
+      schedule-enabled: true
+      workers: 4
+      per-endpoint: 1
+    sources:
+      incoming:
+        endpoint-id: <已配置连接的 ID>
+        source-path: incoming
+        scan-depth: 1
+        unit-type: FILE
+        file-pattern: "*.bin"
+        validation: BASIC
+        target-ref: delivery
+        recipient-id: consumer
+        caller-ids: [consumer]
+        access-base: https://business.example/data
+        stable-observations: 3
+        observation-seconds: 60
+        minimum-observation-seconds: 120
+```
+
+扫描与传输分别使用有界线程池。每连接扫描额度也受连接并发数约束，多扫描线程时为其他连接保留至少一个槽位。大文件由原传输池下载。只有完整扫描才更新稳定观察和缺失状态。扫描记录保留配置版本、触发类型、耗时、错误、候选与任务复用情况。单次 API 和重叠监听复用同一交付键及历史交付。不同接收方、落地映射或校验等级分别交付。
+
+启停作用于后续周期。已停用监听仍可执行手动扫描，已停用连接拒绝新的扫描和拉取任务。回退周期功能时设置 `platform.pulls.listeners.schedule-enabled=false`，由现有执行链处理已入库任务、通知与验收。V7 为增量迁移，回退周期触发时保留监听、基线和交付记录。
+
 ## 测试、迁移与回退
 
-纯单元/页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`，不需要数据库。`./mvnw -B clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`；默认 URL 数据库名须以 `_test` 结尾，禁止 URL 内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权在本机应用库验收时，额外设置 `TEST_DB_ALLOW_LOCAL=true`，才允许回环地址上与 `DB_URL` 相同的非系统数据库。每次测试创建随机 `foundation_it_*` / `endpoint_it_*` / `task_it_*` / `push_it_*` schema，只删除本次随机 schema，不清空数据库或修改现有业务 schema。真实协议服务仅监听回环地址，使用临时目录和测试凭据。测试覆盖空库 V1→V6、已含固定推送记录的 V4→V6 增量迁移、JPA、重启保留、测试专用 V7 升级、页面防伪、双协议能力、任务幂等、领取、通知补发及故障回滚等。
+纯单元/页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`，不需要数据库。`./mvnw -B clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`。默认 URL 数据库名须以 `_test` 结尾，禁止 URL 内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权在本机应用库验收时，额外设置 `TEST_DB_ALLOW_LOCAL=true`，才允许回环地址上与 `DB_URL` 相同的非系统数据库。每次集成测试创建并清理自己的随机 schema。真实协议服务仅监听回环地址，使用临时目录和测试凭据。测试覆盖 V1→V7、含固定推送记录的 V4→V7 增量迁移、测试专用 V8 升级、真实双协议能力、跨入口去重和领取、通知补发、扫描恢复及故障回滚等。
 
 首次启动由 Flyway 在应用 schema 建立迁移历史与 `platform_metadata`，通过 `PlatformMetadata` 实体和 `JpaRepository` 读写。Hibernate 使用 `ddl-auto=validate` 校验映射，关闭 Open Session in View；不自动创建或修改表。V1 只保存平台元数据，不预建业务表。后续升级新增 Flyway 迁移，不改写已执行 SQL。JPA 改造兼容已有 V1 表，不需要删表或重新建库。测试专用迁移不进入应用 JAR。失败迁移直接阻止启动，不执行 Flyway clean。
 
