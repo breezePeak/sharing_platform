@@ -1,7 +1,5 @@
 package com.siwei;
 
-import com.siwei.transfer.NotificationDispatcher;
-import com.siwei.transfer.TaskWorker;
 import com.siwei.web.EndpointCsrfFilter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -14,7 +12,7 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.mock.mockito.SpyBean;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.env.MockEnvironment;
@@ -26,7 +24,6 @@ import org.springframework.test.web.servlet.MockMvc;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
-import static org.mockito.Mockito.doNothing;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -48,16 +45,13 @@ class ConsoleIT {
 
     @Autowired MockMvc mvc;
     @Autowired JdbcTemplate db;
-    @SpyBean TaskWorker worker;
-    @SpyBean NotificationDispatcher dispatcher;
+    @Autowired com.siwei.transfer.TransferJpa transferDb;
+    @MockBean org.springframework.scheduling.TaskScheduler scheduler;
     @LocalServerPort int port;
-    @org.junit.jupiter.api.io.TempDir Path browserFiles;
 
     String endpoint, revision;
 
     @BeforeEach void seed() {
-        doNothing().when(worker).poll();
-        doNothing().when(dispatcher).poll();
         endpoint = id(); revision = id();
         db.update("INSERT INTO endpoint(id,revision,enabled) VALUES (?,1,true)", endpoint);
         db.update("INSERT INTO endpoint_revision(id,endpoint_id,revision,name,protocol,host,port,username,auth,read_root,write_root,"
@@ -131,13 +125,16 @@ class ConsoleIT {
         db.update("UPDATE transfer_notification SET status='ACKED' WHERE id=?", notice);
         mvc.perform(post(resend).session(session).param("_csrf", csrf).param("nonce", id())).andExpect(status().isConflict());
         String reconcile = task("PUSH", "RECONCILING", "PUBLISHING");
-        db.update("UPDATE transfer_task SET push_publish_intent=true WHERE id=?", reconcile);
+        db.update("UPDATE transfer_task SET push_publish_intent=true,reconcile_attempts=8,next_run_at=now() WHERE id=?", reconcile);
+        assertThat(transferDb.claimTask(reconcile, id())).isZero();
         String recheck = "/tasks/" + reconcile + "/recheck";
-        mvc.perform(get("/tasks/" + reconcile)).andExpect(status().isOk()).andExpect(content().string(containsString("发布结果待核对")));
+        mvc.perform(get("/tasks/" + reconcile)).andExpect(status().isOk()).andExpect(content().string(containsString("发布结果待核对")))
+                .andExpect(content().string(containsString("自动核对已到上限")));
         mvc.perform(post(recheck).session(session).param("_csrf", csrf).param("nonce", id())).andExpect(status().is3xxRedirection());
         assertThat(db.queryForObject("SELECT read_only_recheck FROM transfer_task WHERE id=?", Boolean.class, reconcile)).isTrue();
         assertThat(db.queryForObject("SELECT status FROM transfer_task WHERE id=?", String.class, reconcile)).isEqualTo("RECONCILING");
         mvc.perform(post(recheck).session(session).param("_csrf", csrf).param("nonce", id())).andExpect(status().isConflict());
+        assertThat(transferDb.claimTask(reconcile, id())).isEqualTo(1);
         mvc.perform(get("/api/transfers/tasks/" + push)).andExpect(status().isUnauthorized());
     }
 
@@ -160,8 +157,9 @@ class ConsoleIT {
     @Test @EnabledIfEnvironmentVariable(named = "TEST_BROWSER_EXE", matches = ".+")
     void chromiumRendersTheLiveConsoleAndStatusEndpoint() throws Exception {
         String task = task("PULL", "WAITING_ACCEPTANCE", "WAITING_ACCEPTANCE");
-        Path output = browserFiles.resolve("console.html"), errors = browserFiles.resolve("browser.log");
-        Path profile = Files.createTempDirectory(Path.of("target").toAbsolutePath(), "console-chrome-");
+        Path target = Path.of("target").toAbsolutePath();
+        Path output = target.resolve("console-browser.html"), errors = target.resolve("console-browser.log");
+        Path profile = Files.createTempDirectory(target, "console-chrome-");
         Process browser = new ProcessBuilder(System.getenv("TEST_BROWSER_EXE"), "--headless=new", "--no-first-run", "--disable-gpu",
                 "--disable-background-networking", "--no-proxy-server", "--disable-breakpad", "--user-data-dir=" + profile,
                 "--dump-dom", "http://127.0.0.1:" + port + "/tasks/" + task)
@@ -171,7 +169,6 @@ class ConsoleIT {
             assertThat(browser.exitValue()).isZero();
             assertThat(Files.readString(output)).contains("下载及技术检查通过，待平台验收", "data-task-summary",
                     "/tasks/" + task + "/status", "/js/task-refresh.js");
-            Files.copy(output, Path.of("target", "console-browser.html"), StandardCopyOption.REPLACE_EXISTING);
         } finally { if (browser.isAlive()) browser.destroyForcibly(); }
     }
 

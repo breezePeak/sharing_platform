@@ -94,7 +94,7 @@ class PostgresIT {
                 sql.execute("INSERT INTO transfer_file(task_id,product_id,relative_path,size_bytes,sha256,source_modified_millis,uploaded_bytes,verified) VALUES ('upgrade-task','p','a.bin',7,repeat('b',64),1234,7,true)");
             }
             assertThat(Flyway.configure().dataSource(URL, USER, PASSWORD).defaultSchema(schema)
-                    .locations("classpath:db/migration").load().migrate().migrationsExecuted).isEqualTo(4);
+                    .locations("classpath:db/migration").load().migrate().migrationsExecuted).isEqualTo(5);
             try (var connection = DriverManager.getConnection(URL, USER, PASSWORD); var sql = connection.createStatement();
                  var row = sql.executeQuery("SELECT t.push_manifest_sha256,t.push_target_root,t.push_manifest,t.push_manifest_intent,f.uploaded_bytes,f.verified,f.upload_traffic_bytes,f.readback_bytes FROM "
                          + schema + ".transfer_task t JOIN " + schema + ".transfer_file f ON f.task_id=t.id WHERE t.id='upgrade-task'")) {
@@ -115,7 +115,7 @@ class PostgresIT {
             assertThat(original.migrate().migrationsExecuted).isEqualTo(1);
             Flyway upgraded = Flyway.configure().dataSource(URL, USER, PASSWORD).defaultSchema(upgradeSchema)
                     .locations("classpath:db/migration", "classpath:db/upgrade").load();
-            assertThat(upgraded.migrate().migrationsExecuted).isEqualTo(8);
+            assertThat(upgraded.migrate().migrationsExecuted).isEqualTo(9);
             try (var connection = DriverManager.getConnection(URL, USER, PASSWORD);
                  var statement = connection.createStatement()) {
                 try (var result = statement.executeQuery("SELECT value, description FROM " + upgradeSchema

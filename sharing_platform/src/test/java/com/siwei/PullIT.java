@@ -102,24 +102,19 @@ class PullIT {
     @Autowired TransferSettings transferSettings;
     @Autowired PullProcessor pulls;
     @Autowired PullListenerService listeners;
-    @org.springframework.boot.test.mock.mockito.SpyBean PullListenerScanner scanner;
+    @Autowired PullListenerScanner scanner;
     @Autowired PullStore store;
     @Autowired TransferJpa taskDb;
     @Autowired TaskService tasks;
-    @org.springframework.boot.test.mock.mockito.SpyBean TaskWorker worker;
-    @org.springframework.boot.test.mock.mockito.SpyBean NotificationDispatcher notifications;
+    @Autowired TaskWorker worker;
+    @Autowired NotificationDispatcher notifications;
+    @org.springframework.boot.test.mock.mockito.MockBean org.springframework.scheduling.TaskScheduler scheduler;
     @Autowired org.springframework.transaction.PlatformTransactionManager manager;
     @Autowired MutableClock clock;
     @Autowired ObjectMapper json;
     @Autowired JdbcTemplate db;
     @Autowired MockMvc mvc;
     @TempDir Path remoteRoot;
-
-    @BeforeEach void controlTaskScheduling() {
-        doNothing().when(worker).poll();
-        doNothing().when(notifications).poll();
-        doNothing().when(scanner).poll();
-    }
 
     @AfterEach void stopListeners() {
         db.update("UPDATE pull_listener SET enabled=false,manual_pending=false");
@@ -313,12 +308,13 @@ class PullIT {
         }
     }
 
-    @Test void overlappingListenersAndApiShareActualDownloadAcrossSourceAliases() throws Exception {
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void overlappingListenersAndApiShareActualDownloadAcrossSourceAliases(EndpointRevision.Protocol protocol) throws Exception {
         clock.time.set(Instant.now());
         Files.createDirectories(remoteRoot.resolve("incoming"));
         Files.writeString(remoteRoot.resolve("incoming/a.bin"), "payload across entrances");
-        try (ProtocolServers ftp = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            String folder = source(ftp, EndpointRevision.Protocol.FTP, "FILE", "incoming");
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            String folder = source(server, protocol, "FILE", "incoming");
             String endpoint = configured(folder).getEndpointId();
             configured(folder).setScanDepth(1);
             configured(folder).setFilePattern("*.bin");
@@ -377,7 +373,7 @@ class PullIT {
             assertThat(reads).hasValue(1);
             assertThat(listenerTasks(primary)).hasSize(1);
             String canonicalKey = db.queryForObject("SELECT delivery_key FROM pull_transfer WHERE id=?", String.class, shared);
-            String legacyKey = "a".repeat(64);
+            String legacyKey = UUID.randomUUID().toString().replace("-", "").repeat(2);
             db.update("INSERT INTO pull_delivery_key(delivery_key,current_transfer_id) VALUES (?,?)", legacyKey, shared);
             db.update("UPDATE pull_transfer SET delivery_key=? WHERE id=?", legacyKey, shared);
             db.update("DELETE FROM pull_delivery_key WHERE delivery_key=?", canonicalKey);
@@ -614,10 +610,11 @@ class PullIT {
         }
     }
 
-    @Test void sourceChangeDuringDownloadRestartsCandidateWithoutMixedPublication() throws Exception {
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void sourceChangeDuringDownloadRestartsCandidateWithoutMixedPublication(EndpointRevision.Protocol protocol) throws Exception {
         Files.writeString(remoteRoot.resolve("moving.bin"), "original");
-        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            String source = source(server, EndpointRevision.Protocol.FTP, "FILE", "moving.bin"); String task = accept(source);
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            String source = source(server, protocol, "FILE", "moving.bin"); String task = accept(source);
             AtomicBoolean changed = new AtomicBoolean();
             RemoteFileClientFactory changing = mock(RemoteFileClientFactory.class);
             when(changing.connect(any())).thenAnswer(invocation -> {
@@ -717,9 +714,10 @@ class PullIT {
         }
     }
 
-    @Test void lostNotificationAckDoesNotBlockEarlyReceiptOrRedownload() throws Exception {
-        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            String source = source(server, EndpointRevision.Protocol.FTP, "FILE", "sample.bin");
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void lostNotificationAckDoesNotBlockEarlyReceiptOrRedownload(EndpointRevision.Protocol protocol) throws Exception {
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            String source = source(server, protocol, "FILE", "sample.bin");
             String external = "lost-" + UUID.randomUUID(); lostAcks.add(external);
             String task = accept(source, external); runOnce(task, pulls); String id = transferId(task);
             await(() -> { dispatch(); return "RETRY_WAIT".equals(db.queryForObject("SELECT status FROM transfer_notification WHERE transfer_id=?", String.class, id)); });
@@ -734,9 +732,10 @@ class PullIT {
         }
     }
 
-    @Test void receiptsEnforceRecipientVersionPublishedStateAndTerminalConflictHistory() throws Exception {
-        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            String source = source(server, EndpointRevision.Protocol.FTP, "FILE", "sample.bin");
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void receiptsEnforceRecipientVersionPublishedStateAndTerminalConflictHistory(EndpointRevision.Protocol protocol) throws Exception {
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            String source = source(server, protocol, "FILE", "sample.bin");
             String task = accept(source); runOnce(task, pulls); String id = transferId(task);
             mvc.perform(post("/api/sharing/pull/confirmations").header("Authorization", "Bearer other-test-token")
                     .contentType("application/json").content(receipt(id, "ACCEPTED").toString())).andExpect(status().isForbidden()).andExpect(jsonPath("$.code").value("RECIPIENT_FORBIDDEN"));
@@ -751,10 +750,11 @@ class PullIT {
         }
     }
 
-    @Test void redeliveryProtectsOldRoundAndIndependentSourceVersions() throws Exception {
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void redeliveryProtectsOldRoundAndIndependentSourceVersions(EndpointRevision.Protocol protocol) throws Exception {
         Files.writeString(remoteRoot.resolve("round.bin"), "version one");
-        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            String source = source(server, EndpointRevision.Protocol.FTP, "FILE", "round.bin");
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            String source = source(server, protocol, "FILE", "round.bin");
             String first = accept(source); runOnce(first, pulls); String old = transferId(first);
             String next = pulls.redeliver(old, "operator repaired local storage");
             assertThat(next).isNotEqualTo(old);
@@ -996,11 +996,10 @@ class PullIT {
     }
     private void uncheckedRun(String task, PullProcessor processor) { try { runOnce(task, processor); } catch (Exception e) { throw new RuntimeException(e); } }
     private void dispatch() {
-        doCallRealMethod().when(notifications).poll();
-        try { notifications.poll(); } finally { doNothing().when(notifications).poll(); }
+        notifications.poll();
     }
     private void awaitPublished(String task) throws Exception {
-        doCallRealMethod().when(worker).poll(); worker.poll(); doNothing().when(worker).poll();
+        worker.poll();
         await(() -> "WAITING_ACCEPTANCE".equals(state(task)));
     }
     private String state(String task) { return db.queryForObject("SELECT status FROM transfer_task WHERE id=?", String.class, task); }

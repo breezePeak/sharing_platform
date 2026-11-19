@@ -134,13 +134,14 @@ class PushIT {
         }
     }
 
-    @Test void sameSizeCorruptTargetNeverPublishes() throws Exception {
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void sameSizeCorruptTargetNeverPublishes(EndpointRevision.Protocol protocol) throws Exception {
         Path product = SOURCE.resolve("corrupt"); Files.createDirectories(product);
         Files.writeString(product.resolve("a.bin"), "original");
         Path other = SOURCE.resolve("corrupt-other"); Files.createDirectories(other);
         Files.writeString(other.resolve("b.bin"), "original");
-        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(protocol); form.localSourceRef = "source";
             String endpointId = endpoints.save(null, form);
             Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
             task.products = List.of(Map.of("product_id", "p1", "product_path", "corrupt"),
@@ -207,11 +208,12 @@ class PushIT {
         }
     }
 
-    @Test void readyRenameSucceededButReplyLostReconcilesWithoutReupload() throws Exception {
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void readyRenameSucceededButReplyLostReconcilesWithoutReupload(EndpointRevision.Protocol protocol) throws Exception {
         Path product = SOURCE.resolve("lost-reply"); Files.createDirectories(product);
         Files.writeString(product.resolve("a.bin"), "fixed content");
-        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(protocol); form.localSourceRef = "source";
             String endpointId = endpoints.save(null, form);
             Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
             task.products = List.of(Map.of("product_id", "p1", "product_path", "lost-reply"));
@@ -242,11 +244,12 @@ class PushIT {
         }
     }
 
-    @Test void interruptedFileStreamRestartsSameFileAndPublishesOnce() throws Exception {
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void interruptedFileStreamRestartsSameFileAndPublishesOnce(EndpointRevision.Protocol protocol) throws Exception {
         Path product = SOURCE.resolve("interrupted"); Files.createDirectories(product);
         Files.writeString(product.resolve("a.bin"), "long enough to break midstream");
-        try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
-            EndpointForm form = server.form(EndpointRevision.Protocol.FTP); form.localSourceRef = "source";
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(protocol); form.localSourceRef = "source";
             String endpointId = endpoints.save(null, form);
             Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
             task.products = List.of(Map.of("product_id", "p1", "product_path", "interrupted"));

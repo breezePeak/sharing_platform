@@ -14,7 +14,7 @@ import java.util.concurrent.*;
 import javax.annotation.PreDestroy;
 import org.slf4j.*;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -22,7 +22,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
 
 @Component
-@ConditionalOnProperty(name = "platform.pulls.enabled", havingValue = "true", matchIfMissing = true)
+@org.springframework.context.annotation.DependsOn("startupRecovery")
+@ConditionalOnExpression("${platform.pulls.enabled:true} && ${platform.recovery.dispatch-enabled:true}")
 public class PullListenerScanner {
     private static final Logger log = LoggerFactory.getLogger(PullListenerScanner.class);
     private static final int LEASE_SECONDS = 90;

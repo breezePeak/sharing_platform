@@ -15,6 +15,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 @Component
+@org.springframework.context.annotation.DependsOn("startupRecovery")
+@org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(name = "platform.recovery.dispatch-enabled", matchIfMissing = true)
 public class TaskWorker {
     private static final Logger log = LoggerFactory.getLogger(TaskWorker.class);
     private final TransferJpa db;

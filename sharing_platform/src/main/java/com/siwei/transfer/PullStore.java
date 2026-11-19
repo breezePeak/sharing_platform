@@ -40,7 +40,7 @@ public class PullStore {
     }
 
     public List<Map<String, Object>> deliveries(String task) {
-        return rows("SELECT u.source_path,u.status AS unit_status,u.error_type AS unit_error,t.id AS transfer_id,t.source_version,t.version_basis,t.version_strength,t.status,t.acceptance_status,t.error_type,t.acceptance_reason,t.acceptance_category,t.acceptance_reminded_at,t.data_location,t.published_at FROM pull_task_unit u LEFT JOIN pull_transfer t ON t.id=u.transfer_id WHERE u.task_id=? ORDER BY u.source_path", task);
+        return rows("SELECT u.source_path,u.status AS unit_status,u.error_type AS unit_error,t.id AS transfer_id,t.source_version,t.version_basis,t.version_strength,t.status,t.acceptance_status,t.error_type,t.acceptance_reason,t.acceptance_category,t.acceptance_reminded_at,t.data_location,t.published_at,t.reconcile_attempts FROM pull_task_unit u LEFT JOIN pull_transfer t ON t.id=u.transfer_id WHERE u.task_id=? ORDER BY u.source_path", task);
     }
     public List<Map<String, Object>> notifications(String task) {
         return rows("SELECT n.id,n.stage,n.status,n.attempts,n.last_error,n.transfer_id FROM transfer_notification n WHERE n.task_id=? OR n.transfer_id IN (SELECT transfer_id FROM pull_task_transfer WHERE task_id=?) ORDER BY n.created_at", task, task);
@@ -65,16 +65,19 @@ public class PullStore {
         Map<String, Object> record = one("SELECT status,claim_id,pull_scan_complete FROM transfer_task WHERE id=? FOR UPDATE", task);
         if (claim != null && !claim.equals(record.get("claim_id"))) return;
         List<Map<String, Object>> units = deliveries(task);
-        boolean waiting = !(Boolean) record.get("pull_scan_complete"), pending = false, failed = false, rejected = false;
+        boolean runnable = !(Boolean) record.get("pull_scan_complete"), blockedPublication = false;
+        boolean pending = false, failed = false, rejected = false;
         for (Map<String, Object> u : units) {
             if ("REJECTED".equals(u.get("acceptance_status"))) rejected = true;
             if (u.get("transfer_id") == null) {
-                if ("FAILED".equals(u.get("unit_status"))) failed = true; else waiting = true;
+                if ("FAILED".equals(u.get("unit_status"))) failed = true; else runnable = true;
             } else if ("FAILED".equals(u.get("status")) || "REJECTED".equals(u.get("acceptance_status"))) failed = true;
-            else if ("SOURCE_CHANGED".equals(u.get("status"))) waiting = true;
-            else if (!"PUBLISHED".equals(u.get("status"))) waiting = true;
+            else if ("PUBLISHING".equals(u.get("status")) && ((Number) u.get("reconcile_attempts")).intValue() >= TransferJpa.RECONCILE_LIMIT)
+                blockedPublication = true;
+            else if (!"PUBLISHED".equals(u.get("status"))) runnable = true;
             else if (!"ACCEPTED".equals(u.get("acceptance_status"))) pending = true;
         }
+        boolean waiting = runnable || blockedPublication;
         String state = waiting ? "WAITING_SOURCE" : pending ? "WAITING_ACCEPTANCE" : failed ? "FAILED" : units.isEmpty() ? "NO_NEW_DATA" : "SUCCEEDED";
         String acceptance = pending ? "PENDING" : waiting ? "NOT_STARTED" : failed ? rejected ? "REJECTED" : "NOT_STARTED" : units.isEmpty() ? "NOT_STARTED" : "ACCEPTED";
         String error = failed ? "UNIT_FAILED" : null;
@@ -82,7 +85,9 @@ public class PullStore {
             update("UPDATE transfer_task SET acceptance_status=?,updated_at=now() WHERE id=?", acceptance, task);
             return;
         }
-        update("UPDATE transfer_task SET status=?,phase=?,acceptance_status=?,error_type=?,error_detail=NULL,next_run_at=now()+(? * interval '1 second'),attempts=0,claim_id=NULL,claimed_at=NULL,updated_at=now(),version=version+1,read_only_recheck=read_only_recheck AND NOT ? WHERE id=?",
-                state, state, acceptance, error, delaySeconds, claim != null, task);
+        update("UPDATE transfer_task SET status=?,phase=?,acceptance_status=?,error_type=?,error_detail=NULL,"
+                        + "next_run_at=now()+(? * interval '1 second'),attempts=0,claim_id=NULL,claimed_at=NULL,updated_at=now(),version=version+1,"
+                        + "read_only_recheck=read_only_recheck AND NOT ?,reconcile_attempts=? WHERE id=?",
+                state, state, acceptance, error, delaySeconds, claim != null, blockedPublication && !runnable ? TransferJpa.RECONCILE_LIMIT : 0, task);
     }
 }

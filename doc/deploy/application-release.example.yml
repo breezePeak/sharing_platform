@@ -1,0 +1,49 @@
+# Copy to a protected external location and replace the example endpoint ID and paths.
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 10
+server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  port: ${SERVER_PORT:8080}
+platform:
+  console:
+    username: ${CONSOLE_USERNAME}
+    password: ${CONSOLE_PASSWORD}
+  endpoints:
+    master-key: ${ENDPOINT_MASTER_KEY}
+    key-directory: ${ENDPOINT_KEY_DIRECTORY}
+    local-roots:
+      source: ${SHARING_SOURCE_ROOT}
+      delivery: ${SHARING_DELIVERY_ROOT}
+  recovery:
+    dispatch-enabled: ${SHARING_DISPATCH_ENABLED:true}
+  transfers:
+    push-intake-enabled: ${SHARING_PUSH_INTAKE_ENABLED:true}
+    provisional-xml-enabled: false
+    callers:
+      consumer:
+        token: ${SHARING_CONSUMER_TOKEN}
+        endpoint-ids: [replace-after-creating-endpoint]
+        notification-url: ${SHARING_CONSUMER_NOTIFICATION_URL}
+  pulls:
+    intake-enabled: ${SHARING_PULL_INTAKE_ENABLED:true}
+    listeners:
+      schedule-enabled: ${SHARING_SCHEDULE_ENABLED:true}
+      workers: 4
+      per-endpoint: 1
+    sources:
+      incoming:
+        endpoint-id: replace-after-creating-endpoint
+        source-path: incoming
+        scan-depth: 1
+        unit-type: FILE
+        file-pattern: "*.bin"
+        validation: BASIC
+        target-ref: delivery
+        recipient-id: consumer
+        caller-ids: [consumer]
+        access-base: ${SHARING_CUSTOMER_ACCESS_BASE}

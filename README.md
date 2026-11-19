@@ -133,9 +133,13 @@ platform:
 
 `/config/routes` 显示外置来源、路由与通知绑定的配置检查。`V8__operations_console.sql` 为增量迁移。若需撤掉新增运维操作，部署代理可限制 `/tasks/**/recheck` 与 `/tasks/**/resend` 的 POST，保留运行状态和原任务执行链。
 
+## PR8 部署与恢复
+
+默认监听回环地址。按 schema 执行 PostgreSQL 单实例保护，启动后核对未完成的领取。发布结果未知时保留待核对状态并有界退避，操作员可在既有控制台发起只读复核。部署、备份及回退见 [单机部署和恢复](doc/deploy/single-node.md)。
+
 ## 测试、迁移与回退
 
-纯单元/页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`，不需要数据库。`./mvnw -B clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`。默认 URL 数据库名须以 `_test` 结尾，禁止 URL 内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权在本机应用库验收时，额外设置 `TEST_DB_ALLOW_LOCAL=true`，才允许回环地址上与 `DB_URL` 相同的非系统数据库。每次集成测试创建并清理自己的随机 schema。真实协议服务仅监听回环地址，使用临时目录和测试凭据。测试覆盖 V1→V7、含固定推送记录的 V4→V7 增量迁移、测试专用 V8 升级、真实双协议能力、跨入口去重和领取、通知补发、扫描恢复及故障回滚等。
+纯单元、页面及真实 FTP/SFTP 适配器测试可执行 `./mvnw test`。`./mvnw -B clean verify` 必须设置 `TEST_DB_URL`、`TEST_DB_USERNAME`、`TEST_DB_PASSWORD`。默认 URL 数据库名须以 `_test` 结尾，禁止内嵌凭据、查询参数和片段，拒绝与 `DB_URL` 相同的连接。经明确授权后设置 `TEST_DB_ALLOW_LOCAL=true` 才允许回环地址上的同一非系统数据库。真实协议服务仅监听回环地址并使用临时目录。完整验收另设 `TEST_BROWSER_EXE` 指向 Chrome/Chromium，`TEST_PG_BIN` 指向 PostgreSQL 客户端工具目录。备份演练使用 `_test` 库和可建临时数据库的测试账号。测试覆盖 V1→V9、含固定推送记录的 V4→V9、测试专用 V10、实际进程和发布恢复、双协议、领取和重试。
 
 首次启动由 Flyway 在应用 schema 建立迁移历史与 `platform_metadata`，通过 `PlatformMetadata` 实体和 `JpaRepository` 读写。Hibernate 使用 `ddl-auto=validate` 校验映射，关闭 Open Session in View；不自动创建或修改表。V1 只保存平台元数据，不预建业务表。后续升级新增 Flyway 迁移，不改写已执行 SQL。JPA 改造兼容已有 V1 表，不需要删表或重新建库。测试专用迁移不进入应用 JAR。失败迁移直接阻止启动，不执行 Flyway clean。
 

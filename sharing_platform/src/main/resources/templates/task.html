@@ -31,7 +31,8 @@
   <p th:if="${task.error_type != null}" th:text="|${task.error_type} ${task.error_detail ?: ''}|"></p>
   <p th:if="${task.error_type != null && !task.recheck}">查看对应文件、单元或通知记录后再处置。</p>
   <p th:if="${task.source_wait != null}" th:text="|${task.source_wait.source_path} · ${task.source_wait.error_type}|"></p>
-  <p th:if="${task.status == 'WAITING_SOURCE' || task.status == 'RECONCILING'}"
+  <p th:if="${task.publication_attention}">自动核对已到上限，等待操作员核对发布证据。</p>
+  <p th:if="${!task.publication_attention && (task.status == 'WAITING_SOURCE' || task.status == 'RECONCILING')}"
      th:text="|下次检查 ${task.next_run_at}|"></p>
 </div>
     <p data-refresh-warning hidden role="status">状态暂未刷新，正在显示上次取得的数据。</p>

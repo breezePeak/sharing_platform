@@ -16,7 +16,7 @@ public class ConsoleQueryService {
     public static final int PAGE_SIZE = 25;
     private static final String TASK = "SELECT t.id,t.external_task_id,t.endpoint_id,t.listener_id,t.listener_revision,t.trigger_type,t.caller_id,"
             + "t.direction,t.status,t.phase,t.acceptance_status,t.error_type,t.error_detail,t.created_at,t.updated_at,t.next_run_at,t.attempts,"
-            + "t.current_file,t.read_only_recheck,t.push_publish_intent,t.push_target_root,t.push_source_root,t.push_manifest_sha256,"
+            + "t.current_file,t.read_only_recheck,t.reconcile_attempts,t.push_publish_intent,t.push_target_root,t.push_source_root,t.push_manifest_sha256,"
             + "t.pull_scan_complete,(t.pull_config IS NOT NULL) AS has_pull_config,r.name AS endpoint_name,r.protocol,r.host,r.port,r.revision,"
             + "r.read_root,r.write_root,cast(t.push_route_snapshot AS json)->>'version' AS route_version,"
             + "cast(t.pull_config AS json)->>'recipientId' AS recipient_id,cast(t.pull_config AS json)->>'targetRef' AS target_ref,"
@@ -143,6 +143,8 @@ public class ConsoleQueryService {
                 : null);
         row.put("notices", notices);
         row.put("sampled_at", Instant.now());
+        row.put("publication_attention", Set.of("RECONCILING", "WAITING_SOURCE").contains(row.get("status"))
+                && number(row, "reconcile_attempts") >= TransferJpa.RECONCILE_LIMIT && !Boolean.TRUE.equals(row.get("read_only_recheck")));
         row.put("elapsed", Math.max(0, Duration.between(((Timestamp) row.get("created_at")).toInstant(),
                 (Set.of("SUCCEEDED", "FAILED", "REJECTED", "NO_NEW_DATA").contains(row.get("status"))
                         ? ((Timestamp) row.get("updated_at")).toInstant() : Instant.now())).getSeconds()));

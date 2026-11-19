@@ -373,7 +373,8 @@ public class PullProcessor implements TaskProcessor {
             long active = ((Number) db.one("SELECT count(*) AS n FROM pull_transfer WHERE endpoint_id=? AND claim_id IS NOT NULL AND claimed_at>now()-interval '5 minutes'", task.endpointId).get("n")).longValue();
             if (active >= concurrency) return false;
             return db.update("UPDATE pull_transfer SET claim_id=?,claimed_at=now(),attempts=attempts+1 WHERE id=? "
-                    + "AND ((? AND status='PUBLISHING' AND publish_intent) OR (NOT ? AND status IN ('DOWNLOADING','PUBLISHING') AND next_run_at<=now())) "
+                    + "AND ((? AND status='PUBLISHING' AND publish_intent) OR (NOT ? AND status IN ('DOWNLOADING','PUBLISHING') "
+                    + "AND reconcile_attempts<" + TransferJpa.RECONCILE_LIMIT + " AND next_run_at<=now())) "
                     + "AND (claim_id IS NULL OR claimed_at<now()-interval '5 minutes')", claim, id, readOnly, readOnly) == 1;
         });
         if (!acquired) return;
@@ -408,7 +409,10 @@ public class PullProcessor implements TaskProcessor {
         } catch (Exception error) {
             Map<String, Object> current = transfer(id);
             if ((Boolean) current.get("publish_intent")) {
-                db.update("UPDATE pull_transfer SET claim_id=NULL,claimed_at=NULL,error_type='PUBLICATION_UNKNOWN',next_run_at=now()+interval '30 seconds' WHERE id=? AND claim_id=?", id, claim);
+                db.update("UPDATE pull_transfer SET claim_id=NULL,claimed_at=NULL,error_type='PUBLICATION_UNKNOWN',"
+                        + "next_run_at=now()+least(300,30*power(2,least(reconcile_attempts,4)))*interval '1 second',"
+                        + "reconcile_attempts=CASE WHEN ? THEN reconcile_attempts ELSE least(reconcile_attempts+1," + TransferJpa.RECONCILE_LIMIT + ") END "
+                        + "WHERE id=? AND claim_id=?", readOnly, id, claim);
             } else if (error instanceof Changed || error instanceof NotReady) {
                 tx.executeWithoutResult(status -> {
                     if (db.update("UPDATE pull_transfer SET status='SOURCE_CHANGED',error_type='SOURCE_CHANGED',claim_id=NULL,claimed_at=NULL WHERE id=? AND claim_id=?", id, claim) != 1) return;

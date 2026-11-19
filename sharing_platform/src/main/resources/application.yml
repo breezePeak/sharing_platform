@@ -25,6 +25,7 @@ spring:
       pool:
         size: 2
 server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
   tomcat:
     max-http-form-post-size: 16KB
   error:
@@ -52,6 +53,8 @@ logging:
     org.hibernate.SQL: WARN
     org.hibernate.type.descriptor.sql.BasicBinder: WARN
 platform:
+  recovery:
+    dispatch-enabled: ${SHARING_DISPATCH_ENABLED:true}
   console:
     username: ${CONSOLE_USERNAME:}
     password: ${CONSOLE_PASSWORD:}

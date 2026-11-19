@@ -31,3 +31,9 @@ JPA 实体及仓储遵循 [Spring Data JPA 2.7.18 官方文档](https://docs.spr
 - 清单 v1 按 Java UTF-16 字典序排序，新记录保存精确清单文本；旧记录核对原摘要，不改数据库默认 collation、不重冻基准。V6 只新增字段和保守迁移 manifest 意图；V1—V4 不改写，当前工作区既有 V5 保留。
 - 仍使用外置 Spring YAML 提供 caller/type 完整路由，保留 xml-routes 与旧 JSON 兼容入口；受理时持久化路由版本、源/目标/通知/端点修订，重放优先比较旧快照。
 - wrapper Git 模式为 100755，Unix/CI 使用 `./mvnw -B clean verify`，Windows 使用 `.\mvnw.cmd -B clean verify`。本轮实测与边界见 [PR4 审查修复记录](pr/PR-04_审查修复记录.md)。
+
+## 2026-11-19 发布验证
+
+- 控制台沿用同应用页面，生产运行使用外置 Basic 凭据和受限 HTTPS 入口，管理操作同时校验 CSRF。业务 API 保持独立的调用方授权。该部署要求基于 PR7 的运维操作权限，不代表客户已确认最终身份认证方案。
+- V9 记录发布核对次数。单实例启动通过 schema 级 PostgreSQL 锁判断所有权，随后让旧领取重新可用，由原状态机继续处理固定快照、清单、通知和回执。
+- 客户报文、真实地址、网络及消费责任仍需联调，`doc/contracts/confirmed/` 不加入模拟样例。逐项外部状态见 [PR8 实施记录](pr/PR-08_实施记录.md)。

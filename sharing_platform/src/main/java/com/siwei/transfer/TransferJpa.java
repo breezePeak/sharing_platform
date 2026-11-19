@@ -9,6 +9,8 @@ import org.springframework.transaction.annotation.Transactional;
 @Repository
 @Transactional
 public class TransferJpa {
+    static final int RECONCILE_LIMIT = 8;
+    private static final String AUTOMATIC_OR_REQUESTED = "(reconcile_attempts<" + RECONCILE_LIMIT + " OR read_only_recheck)";
     @PersistenceContext private EntityManager entityManager;
     private final com.siwei.endpoint.EndpointCapacity capacity;
     private final TransferFileRepository files;
@@ -47,7 +49,7 @@ public class TransferJpa {
     public List<Map<String, Object>> dueTasks(int limit, int offset) {
         return queryForList("SELECT id,direction FROM (SELECT id,direction,next_run_at,"
                 + "row_number() OVER (PARTITION BY endpoint_id ORDER BY next_run_at,id) AS priority FROM transfer_task "
-                + "WHERE (status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now()) "
+                + "WHERE (status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now() AND " + AUTOMATIC_OR_REQUESTED + ") "
                 + "OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes')) due "
                 + "ORDER BY priority,next_run_at,id LIMIT ? OFFSET ?", limit, offset);
     }
@@ -56,7 +58,9 @@ public class TransferJpa {
         if (candidates.isEmpty()) return 0;
         Map<String, Object> task = candidates.get(0);
         if (!capacity.available((String) task.get("endpoint_id"), ((Number) task.get("concurrency")).intValue(), id)) return 0;
-        return update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() WHERE id=? AND ((status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now()) OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
+        return update("UPDATE transfer_task SET status='RUNNING',claim_id=?,claimed_at=now(),attempts=attempts+1,version=version+1,updated_at=now() "
+                + "WHERE id=? AND ((status IN ('QUEUED','RECONCILING','WAITING_SOURCE','WAITING_ACCEPTANCE') AND next_run_at<=now() AND "
+                + AUTOMATIC_OR_REQUESTED + ") OR (status='RUNNING' AND claimed_at<now()-interval '5 minutes'))", claim, id);
     }
     public int releaseTaskClaim(String id, String claim) {
         return update("UPDATE transfer_task SET status='QUEUED',claim_id=NULL,claimed_at=NULL,attempts=attempts-1,next_run_at=now(),updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'", id, claim);
@@ -70,8 +74,12 @@ public class TransferJpa {
         return update("UPDATE transfer_task SET claimed_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'", id, claim);
     }
     public int finishTask(String id, String claim, TaskProcessor.Result result) {
-        return update("UPDATE transfer_task SET status=?,phase=CASE WHEN ?='COMPLETE' THEN 'NOTIFYING' ELSE ? END,error_type=?,error_detail=?,next_run_at=CASE WHEN ?='RECONCILING' THEN now()+interval '30 seconds' ELSE next_run_at END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now(),read_only_recheck=false,current_file=NULL WHERE id=? AND claim_id=? AND status='RUNNING'",
-                result.status, result.phase, result.phase, result.errorType, result.errorDetail, result.status, id, claim);
+        return update("UPDATE transfer_task SET status=?,phase=CASE WHEN ?='COMPLETE' THEN 'NOTIFYING' ELSE ? END,error_type=?,error_detail=?,"
+                + "next_run_at=CASE WHEN ?='RECONCILING' THEN now()+least(300,30*power(2,least(reconcile_attempts,4)))*interval '1 second' ELSE next_run_at END,"
+                + "reconcile_attempts=CASE WHEN ?='RECONCILING' AND NOT read_only_recheck THEN least(reconcile_attempts+1," + RECONCILE_LIMIT
+                + ") ELSE reconcile_attempts END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now(),read_only_recheck=false,current_file=NULL "
+                + "WHERE id=? AND claim_id=? AND status='RUNNING'",
+                result.status, result.phase, result.phase, result.errorType, result.errorDetail, result.status, result.status, id, claim);
     }
     public int insertNotification(String id, String taskId, String stage, String result, String protocol,
                                   String recipient, String payload, String hash) {

@@ -9,13 +9,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.annotation.PreDestroy;
 import com.siwei.protocol.*;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 @Service
+@org.springframework.context.annotation.DependsOn("startupRecovery")
 public class ProbeRunner {
     private final ProbeStore store;
     private final EndpointRevisionRepository revisions;
@@ -28,9 +27,6 @@ public class ProbeRunner {
         this.store = store; this.revisions = revisions; this.factory = factory;
     }
     private static Thread daemon(Runnable r, String name) { Thread thread = new Thread(r, name); thread.setDaemon(true); return thread; }
-
-    @EventListener(ApplicationReadyEvent.class)
-    public void recover() { store.recoverInterrupted(); }
 
     public String start(String endpointId, long revision) {
         EndpointProbe p = store.create(endpointId, revision);
