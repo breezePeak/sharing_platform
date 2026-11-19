@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>任务记录 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header"><h1>任务记录</h1></div>
+  <form method="get" class="panel fields" th:action="@{/tasks}">
+    <div class="form-grid">
+      <label>方向 <select name="direction">
+        <option value="">全部</option>
+        <option value="PUSH" th:selected="${direction == 'PUSH'}">推送</option>
+        <option value="PULL" th:selected="${direction == 'PULL'}">拉取</option>
+      </select></label>
+      <label>连接 <select name="endpoint">
+        <option value="">全部</option>
+        <option th:each="s : ${services}" th:value="${s.id}" th:text="|${s.name} · ${s.protocol}|"
+                th:selected="${s.id == endpoint}"></option>
+      </select></label>
+      <label>任务状态 <select name="status">
+        <option value="">全部</option>
+        <option th:each="state : ${states}" th:value="${state}" th:text="${state}" th:selected="${state == status}"></option>
+      </select></label>
+      <label>起始日期（UTC）<input type="date" name="since" th:value="${since}"></label>
+      <label>最后日期（UTC）<input type="date" name="until" th:value="${until}"></label>
+    </div>
+    <div class="actions"><button>筛选</button><a class="button button-secondary" th:href="@{/tasks}">清除筛选</a></div>
+  </form>
+  <section class="empty" th:if="${#lists.isEmpty(rows)}"><h2>当前筛选下暂无任务</h2></section>
+  <article class="endpoint-card" th:each="task : ${rows}">
+    <div class="endpoint-card-header">
+      <div>
+        <div class="endpoint-title-row">
+          <span class="badge badge-protocol" th:text="|${task.direction} · ${task.protocol}|"></span>
+          <h2><a th:href="@{/tasks/{id}(id=${task.id})}" th:text="${task.external_task_id}"></a></h2>
+        </div>
+        <p class="endpoint-meta" th:text="|${task.id} · ${task.endpoint_name} · 来源 ${task.source} · ${task.created_at}|"></p>
+      </div>
+      <strong th:text="${task.display}"></strong>
+    </div>
+    <div class="probe-section">
+      <p th:text="${task.known ? task.files + ' 个文件，' + task.bytes + ' 字节' : '扫描或预检查中，待确定总量'}"></p>
+      <p th:text="|阶段 ${task.phase} · 通知待确认 ${task.notices.pending}/${task.notices.total} · 验收 ${task.acceptance_status}|"></p>
+    </div>
+  </article>
+  <nav class="actions" aria-label="任务分页">
+    <a class="button button-secondary" th:if="${page > 0}"
+       th:href="@{/tasks(page=${page - 1},direction=${direction},endpoint=${endpoint},status=${status},since=${since},until=${until})}">上一页</a>
+    <span th:text="|第 ${page + 1} 页|"></span>
+    <a class="button button-secondary" th:if="${more}"
+       th:href="@{/tasks(page=${page + 1},direction=${direction},endpoint=${endpoint},status=${status},since=${since},until=${until})}">下一页</a>
+  </nav>
+</main>
+</body>
+</html>

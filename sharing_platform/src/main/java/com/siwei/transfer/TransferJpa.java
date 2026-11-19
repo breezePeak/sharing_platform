@@ -70,7 +70,7 @@ public class TransferJpa {
         return update("UPDATE transfer_task SET claimed_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'", id, claim);
     }
     public int finishTask(String id, String claim, TaskProcessor.Result result) {
-        return update("UPDATE transfer_task SET status=?,phase=CASE WHEN ?='COMPLETE' THEN 'NOTIFYING' ELSE ? END,error_type=?,error_detail=?,next_run_at=CASE WHEN ?='RECONCILING' THEN now()+interval '30 seconds' ELSE next_run_at END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now() WHERE id=? AND claim_id=? AND status='RUNNING'",
+        return update("UPDATE transfer_task SET status=?,phase=CASE WHEN ?='COMPLETE' THEN 'NOTIFYING' ELSE ? END,error_type=?,error_detail=?,next_run_at=CASE WHEN ?='RECONCILING' THEN now()+interval '30 seconds' ELSE next_run_at END,claim_id=NULL,claimed_at=NULL,version=version+1,updated_at=now(),read_only_recheck=false,current_file=NULL WHERE id=? AND claim_id=? AND status='RUNNING'",
                 result.status, result.phase, result.phase, result.errorType, result.errorDetail, result.status, id, claim);
     }
     public int insertNotification(String id, String taskId, String stage, String result, String protocol,

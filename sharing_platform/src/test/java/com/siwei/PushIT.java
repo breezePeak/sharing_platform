@@ -449,6 +449,44 @@ class PushIT {
         }
     }
 
+    @ParameterizedTest @EnumSource(EndpointRevision.Protocol.class)
+    void manualRecheckUsesExistingPublicationEvidenceWithoutWriting(EndpointRevision.Protocol protocol) throws Exception {
+        String sourceName = "recheck-" + UUID.randomUUID();
+        Files.createDirectories(SOURCE.resolve(sourceName));
+        Files.writeString(SOURCE.resolve(sourceName + "/a.bin"), "read-only recheck");
+        try (ProtocolServers server = new ProtocolServers(remoteRoot, protocol, ProtocolServers.Mode.NORMAL)) {
+            EndpointForm form = server.form(protocol); form.localSourceRef = "source";
+            String endpointId = endpoints.save(null, form);
+            Task task = task(endpointId, revisions.findByEndpointIdAndRevision(endpointId, 1).orElseThrow().id);
+            task.products = List.of(Map.of("product_id", "p1", "product_path", sourceName));
+            assertThat(push.process(task).status).isEqualTo("WAITING_FEEDBACK");
+            task.phase = "PRECHECK_ACKED";
+            assertThat(push.process(task).status).isEqualTo("SUCCEEDED");
+            var record = taskRecords.findById(task.taskRecordId).orElseThrow();
+            record.readOnlyRecheck = true;
+            taskRecords.saveAndFlush(record);
+            Path ready = remoteRoot.resolve("deliver/weather/" + task.taskRecordId + "/_READY");
+            Path held = remoteRoot.resolve("held-marker");
+            Files.move(ready, held);
+            RemoteFileClientFactory readOnly = mock(RemoteFileClientFactory.class);
+            when(readOnly.connect(any(EndpointRevision.class))).thenAnswer(invocation -> {
+                RemoteFileClient real = clients.connect(invocation.getArgument(0));
+                return java.lang.reflect.Proxy.newProxyInstance(RemoteFileClient.class.getClassLoader(),
+                        new Class<?>[] {RemoteFileClient.class}, (proxy, method, args) -> {
+                            if (Set.of("write", "mkdir", "rename", "deleteTemporary").contains(method.getName()))
+                                throw new AssertionError("Manual recheck tried to modify the target");
+                            try { return method.invoke(real, args); }
+                            catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                        });
+            });
+            PushProcessor recheck = new PushProcessor(store, json, revisions, transferSettings, readOnly);
+            assertThat(recheck.process(task).status).isEqualTo("RECONCILING");
+            assertThat(ready).doesNotExist();
+            Files.move(held, ready);
+            assertThat(recheck.process(task).status).isEqualTo("SUCCEEDED");
+        }
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"FTP,ready,false", "FTP,ready,true", "FTP,manifest,false", "FTP,manifest,true", "SFTP,ready,false", "SFTP,ready,true", "SFTP,manifest,false", "SFTP,manifest,true"})
     void interruptedControlFilesRecoverWithoutReupload(EndpointRevision.Protocol protocol, String control, boolean partial) throws Exception {

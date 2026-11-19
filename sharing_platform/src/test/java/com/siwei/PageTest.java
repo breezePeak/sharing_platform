@@ -20,14 +20,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @WebMvcTest(controllers = {PageController.class, PageTest.FailureController.class})
 @Import({TraceFilter.class, WebErrors.class, PageTest.FailureController.class})
+@org.springframework.test.context.ActiveProfiles("test")
 class PageTest {
     @Autowired MockMvc mvc;
+    @org.springframework.boot.test.mock.mockito.MockBean com.siwei.transfer.ConsoleQueryService console;
+    @org.springframework.boot.test.mock.mockito.MockBean com.siwei.web.ConsoleOperations operations;
 
     @Test
     void pagesAreDirectlyAccessibleAndRenderHonestEmptyStates() throws Exception {
         for (String page : new String[] {"/services", "/tasks"}) {
             mvc.perform(get(page)).andExpect(status().isOk())
-                    .andExpect(content().string(containsString(page.equals("/services") ? "监听配置" : "尚未开放")))
+                    .andExpect(content().string(containsString(page.equals("/services") ? "暂无配置服务" : "当前筛选下暂无任务")))
                     .andExpect(content().string(containsString("/css/app.css")))
                     .andExpect(content().string(not(containsString("/login"))));
         }
@@ -46,7 +49,10 @@ class PageTest {
 
     @Test
     void configurationPageHasNoWriteEndpointYet() throws Exception {
-        mvc.perform(post("/config")).andExpect(status().isMethodNotAllowed());
+        var visit = mvc.perform(get("/config")).andReturn();
+        var session = (org.springframework.mock.web.MockHttpSession) visit.getRequest().getSession(false);
+        String csrf = (String) session.getAttribute(com.siwei.web.EndpointCsrfFilter.TOKEN);
+        mvc.perform(post("/config").session(session).param("_csrf", csrf)).andExpect(status().isMethodNotAllowed());
     }
 
     @Test

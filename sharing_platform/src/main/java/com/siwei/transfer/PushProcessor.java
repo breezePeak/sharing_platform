@@ -66,6 +66,12 @@ public class PushProcessor implements TaskProcessor {
             throw new IllegalStateException("MANIFEST_CHANGED");
         if (!hex(hash(manifest)).equals(frozen)) throw new IllegalStateException("MANIFEST_CHANGED");
         try (RemoteFileClient remote = clients.connect(endpoint)) {
+            if (snapshot.readOnlyRecheck) {
+                if (!published(remote, task, target, frozen, manifest))
+                    return new Result("RECONCILING", "PUBLISHING", "PUBLICATION_UNKNOWN", null);
+                verifyTarget(remote, target, task, files, dirs);
+                return new Result("SUCCEEDED", "COMPLETE", null, null);
+            }
             recoverTemporary(remote, task, target, snapshot, manifest, ready(task, frozen));
             if (published(remote, task, target, frozen, manifest)) {
                 verifyTarget(remote, target, task, files, dirs);
@@ -247,6 +253,7 @@ public class PushProcessor implements TaskProcessor {
         if (!before.same(file)) throw new SourceChanged("SOURCE_CHANGED");
         if (exists(remote, target, temporary)) remote.deleteTemporary(temporary, false);
         store.phase(task, "TRANSFERRING");
+        store.uploadStarted(task, file);
         Checkpoint progress = new Checkpoint(task, file, true);
         try (DigestInput input = new DigestInput(Files.newInputStream(local, LinkOption.NOFOLLOW_LINKS), progress)) {
             remote.write(temporary, input);

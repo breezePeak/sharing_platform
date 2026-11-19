@@ -40,11 +40,13 @@
         <a class="button button-secondary" th:href="@{/config/listeners/{id}/runs(id=${row.id})}">运行记录</a>
         <form method="post" th:action="@{/config/listeners/{id}/toggle(id=${row.id})}">
           <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="nonce" th:value="${operationNonce}">
           <input type="hidden" name="editVersion" th:value="${row.edit_version}">
           <button class="button-secondary" th:text="${row.enabled ? '停用' : '启用'}">停用</button>
         </form>
         <form method="post" th:action="@{/config/listeners/{id}/run(id=${row.id})}">
           <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="nonce" th:value="${operationNonce}">
           <button th:disabled="${!row.endpoint_enabled}">执行一次</button>
         </form>
       </div>

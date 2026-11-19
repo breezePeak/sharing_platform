@@ -52,6 +52,10 @@ logging:
     org.hibernate.SQL: WARN
     org.hibernate.type.descriptor.sql.BasicBinder: WARN
 platform:
+  console:
+    username: ${CONSOLE_USERNAME:}
+    password: ${CONSOLE_PASSWORD:}
+    refresh-millis: 2000
   endpoints:
     master-key: ${ENDPOINT_MASTER_KEY:}
     key-directory: ${ENDPOINT_KEY_DIRECTORY:}

@@ -812,7 +812,8 @@ class PullIT {
         }
     }
 
-    @Test void publicationRecoversAfterDatabaseResultLostWithoutReadingRemoteAgain() throws Exception {
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void publicationRecoversAfterDatabaseResultLostWithoutReadingRemoteAgain(boolean manualRecheck) throws Exception {
         try (ProtocolServers server = new ProtocolServers(remoteRoot, EndpointRevision.Protocol.FTP, ProtocolServers.Mode.NORMAL)) {
             String source = source(server, EndpointRevision.Protocol.FTP, "FILE", "sample.bin"); String task = accept(source);
             db.execute("CREATE FUNCTION fail_pull_notice() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.task_id='" + task
@@ -827,7 +828,8 @@ class PullIT {
             RemoteFileClientFactory counting = mock(RemoteFileClientFactory.class);
             when(counting.connect(any())).thenThrow(new java.io.IOException("OFFLINE"));
             PullProcessor recovery = new PullProcessor(store, taskDb, json, revisions, counting, transferSettings, manager, clock);
-            db.update("UPDATE pull_transfer SET next_run_at=now() WHERE id=?", id);
+            if (manualRecheck) db.update("UPDATE transfer_task SET read_only_recheck=true WHERE id=?", task);
+            else db.update("UPDATE pull_transfer SET next_run_at=now() WHERE id=?", id);
             runOnce(task, recovery);
             assertThat(state(task)).isEqualTo("WAITING_ACCEPTANCE"); assertThat(notice(id).path("dataLocation").asText()).contains(id);
             assertThat(db.queryForObject("SELECT count(*) FROM transfer_notification WHERE transfer_id=?", Integer.class, id)).isEqualTo(1);
@@ -949,8 +951,7 @@ class PullIT {
         return tasks.accept("pull", request, request.toString(), "JSON").taskRecordId;
     }
     private void pollListeners() {
-        doCallRealMethod().when(scanner).poll();
-        try { scanner.poll(); } finally { doNothing().when(scanner).poll(); }
+        scanner.dispatch();
     }
     private Map<String, Object> latest(String listener) {
         return db.queryForList("SELECT * FROM pull_listener_run WHERE listener_id=? ORDER BY started_at DESC,id DESC LIMIT 1", listener)

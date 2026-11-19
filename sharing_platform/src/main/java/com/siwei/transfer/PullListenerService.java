@@ -51,6 +51,12 @@ public class PullListenerService {
 
     public Set<String> sourceIds() { return new TreeSet<>(pulls.getSources().keySet()); }
 
+    public void validateConfiguredSource(String id) {
+        var source = pulls.getSources().get(id);
+        var endpoint = endpoints.findById(source.getEndpointId()).orElseThrow();
+        snapshot(id, source.getSourcePath(), current(endpoint));
+    }
+
     @Transactional(readOnly = true)
     public Map<String, Object> form(String id) {
         var listener = require(CURRENT + " WHERE l.id=?", id);

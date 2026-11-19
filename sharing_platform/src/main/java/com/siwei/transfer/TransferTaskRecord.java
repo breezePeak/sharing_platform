@@ -26,6 +26,8 @@ public class TransferTaskRecord {
     @Column(name = "pull_config") public String pullConfig;
     @Column(name = "pull_scan_complete") public boolean pullScanComplete;
     @Column(name = "trigger_type") public String triggerType = "API";
+    @Column(name = "read_only_recheck") public boolean readOnlyRecheck;
+    @Column(name = "current_file") public String currentFile;
     @Column(name = "listener_id") public String listenerId;
     @Column(name = "listener_revision") public Integer listenerRevision;
     public String status, phase;

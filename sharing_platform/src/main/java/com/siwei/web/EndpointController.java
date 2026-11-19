@@ -18,8 +18,9 @@ public class EndpointController {
     private final EndpointService service;
     private final EndpointProbeRepository probes;
     private final ProbeRunner runner;
-    public EndpointController(EndpointService service, EndpointProbeRepository probes, ProbeRunner runner) {
-        this.service = service; this.probes = probes; this.runner = runner;
+    private final ConsoleOperations operations;
+    public EndpointController(EndpointService service, EndpointProbeRepository probes, ProbeRunner runner, ConsoleOperations operations) {
+        this.service = service; this.probes = probes; this.runner = runner; this.operations = operations;
     }
 
     @InitBinder("form")
@@ -31,6 +32,9 @@ public class EndpointController {
     }
     @ModelAttribute("csrfToken")
     Object csrf(HttpServletRequest request) { return request.getSession().getAttribute(EndpointCsrfFilter.TOKEN); }
+
+    @ModelAttribute("operationNonce")
+    String nonce() { return UUID.randomUUID().toString(); }
 
     @GetMapping
     String list(Model model) {
@@ -61,8 +65,15 @@ public class EndpointController {
         return "config/endpoint-edit";
     }
     @PostMapping("/{id}/toggle")
-    String toggle(@PathVariable String id, @RequestParam long revision) {
-        service.toggle(id, revision); return "redirect:/config/endpoints";
+    String toggle(@PathVariable String id, @RequestParam long revision, @RequestParam(required = false) String nonce,
+                  HttpServletRequest request) {
+        boolean enabled = service.form(id).enabled;
+        operations.run((String) request.getAttribute(EndpointCsrfFilter.ACTOR), id, "ENDPOINT_TOGGLE",
+                nonce == null ? nonce() : nonce, enabled ? "ENABLED" : "DISABLED", () -> {
+                    service.toggle(id, revision);
+                    return enabled ? "DISABLED" : "ENABLED";
+                });
+        return "redirect:/config/endpoints";
     }
     @PostMapping("/{id}/clear-credential")
     String clear(@PathVariable String id, @RequestParam long revision, @RequestParam String confirmation) {
@@ -70,8 +81,12 @@ public class EndpointController {
         service.clearCredential(id, revision); return "redirect:/config/endpoints/" + id;
     }
     @PostMapping("/{id}/probe")
-    String probe(@PathVariable String id, @RequestParam long revision) {
-        runner.start(id, revision); return "redirect:/config/endpoints";
+    String probe(@PathVariable String id, @RequestParam long revision, @RequestParam(required = false) String nonce,
+                 HttpServletRequest request) {
+        String before = probes.findFirstByEndpointIdOrderByStartedAtDesc(id).map(p -> p.status).orElse("UNKNOWN");
+        operations.run((String) request.getAttribute(EndpointCsrfFilter.ACTOR), id, "ENDPOINT_PROBE",
+                nonce == null ? nonce() : nonce, before, () -> { runner.start(id, revision); return "RUNNING"; });
+        return "redirect:/config/endpoints";
     }
     @ExceptionHandler(IllegalArgumentException.class)
     @ResponseStatus(HttpStatus.BAD_REQUEST)

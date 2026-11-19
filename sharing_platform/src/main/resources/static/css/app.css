@@ -1273,3 +1273,24 @@ label.check input[type=checkbox] {
     grid-template-columns: 1fr;
   }
 }
+.console-detail + .console-detail,
+.console-listener + .console-listener {
+  border-top: 1px solid var(--slate-200, #dbe4ee);
+  margin-top: 1rem;
+  padding-top: 1rem;
+}
+
+.console-tabs {
+  margin: 1rem 0;
+}
+
+[data-task-summary] progress {
+  display: block;
+  width: min(100%, 32rem);
+  height: 0.85rem;
+  margin: 0.75rem 0;
+}
+
+[data-refresh-warning] {
+  color: var(--amber-800, #854d0e);
+}

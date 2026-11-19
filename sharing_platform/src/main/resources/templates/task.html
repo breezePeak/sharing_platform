@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>任务详情 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+  <script defer th:src="@{/js/task-refresh.js}"></script>
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header">
+    <div><h1 th:text="${task.external_task_id}"></h1><p th:text="|${task.id} · ${task.direction} · ${task.trigger_type}|"></p></div>
+    <a class="button button-secondary" th:href="@{/tasks}">任务列表</a>
+  </div>
+  <section class="panel" th:attr="data-status-url=@{/tasks/{id}/status(id=${task.id})},data-refresh-ms=${refresh}">
+    <div xmlns:th="http://www.thymeleaf.org" th:fragment="summary" data-task-summary>
+  <h2 th:text="${task.display}"></h2>
+  <p th:text="|执行 ${task.status} · 阶段 ${task.phase} · 验收 ${task.acceptance_status}|"></p>
+  <p th:text="|通知待确认 ${task.notices.pending}/${task.notices.total} · 需处理 ${task.notices.failed}|"></p>
+  <p th:unless="${task.known}">扫描或预检查中，待确定总量</p>
+  <p th:if="${task.known}" th:text="|共 ${task.files} 个文件 · ${task.bytes} 字节|"></p>
+  <progress th:if="${task.percent != null}" max="100" th:value="${task.percent}" aria-label="已传输业务字节比例"></progress>
+  <p th:text="|已传输 ${task.sent_files} 个文件、${task.sent} 字节 · 已验证 ${task.verified_files} 个文件、${task.verified_bytes} 字节|"></p>
+  <p th:if="${task.direction == 'PUSH'}" th:text="|回读流量 ${task.readback} 字节 · 重传流量 ${task.retransmitted} 字节|"></p>
+  <p th:if="${task.current_file != null}" th:text="|当前文件 ${task.current_file}|"></p>
+  <p th:if="${task.status == 'RUNNING'}">速度未知</p>
+  <p th:text="|开始 ${task.created_at} · 耗时 ${task.elapsed} 秒 · 当前尝试 ${task.attempts}|"></p>
+  <p th:text="|任务更新时间 ${task.updated_at} · 状态取样 ${task.sampled_at}|"></p>
+  <p th:if="${task.error_type != null}" th:text="|${task.error_type} ${task.error_detail ?: ''}|"></p>
+  <p th:if="${task.error_type != null && !task.recheck}">查看对应文件、单元或通知记录后再处置。</p>
+  <p th:if="${task.source_wait != null}" th:text="|${task.source_wait.source_path} · ${task.source_wait.error_type}|"></p>
+  <p th:if="${task.status == 'WAITING_SOURCE' || task.status == 'RECONCILING'}"
+     th:text="|下次检查 ${task.next_run_at}|"></p>
+</div>
+    <p data-refresh-warning hidden role="status">状态暂未刷新，正在显示上次取得的数据。</p>
+    <form method="post" th:if="${task.recheck}" th:action="@{/tasks/{id}/recheck(id=${task.id})}">
+      <input type="hidden" name="_csrf" th:value="${csrfToken}">
+      <input type="hidden" name="nonce" th:value="${operationNonce}">
+      <button class="button-secondary">核对发布结果</button>
+    </form>
+  </section>
+  <section class="panel">
+    <h2>执行快照</h2>
+    <p th:text="|${task.endpoint_name} · ${task.protocol} · ${task.host} · 端口 ${task.port} · 连接版本 ${task.revision}|"></p>
+    <p th:text="|调用方 ${task.caller_id} · 来源 ${task.source}|"></p>
+    <p th:if="${task.listener_id != null}">
+      <a th:href="@{/config/listeners/{id}/runs(id=${task.listener_id})}"
+         th:text="|监听 ${task.listener_id} · 版本 ${task.listener_revision}|"></a>
+    </p>
+    <div th:if="${task.direction == 'PUSH'}">
+      <p th:text="|路由版本 ${task.route_version ?: '历史记录未保存'} · 本地源 ${task.push_source_root ?: '未记录'}|"></p>
+      <p th:text="|目标 ${task.push_target_root ?: task.requested_target} · 写入根 ${task.write_root ?: '未记录'}|"></p>
+      <p th:if="${task.push_manifest_sha256 != null}">固定清单 SHA-256 <code th:text="${task.push_manifest_sha256}"></code></p>
+    </div>
+    <p th:if="${task.direction == 'PULL'}"
+       th:text="|读取根 ${task.read_root ?: '未记录'} · 源范围 ${task.source_path ?: '未记录'} · 落地引用 ${task.target_ref ?: '未记录'} · 接收方 ${task.recipient_id ?: '未记录'}|"></p>
+  </section>
+  <nav class="actions console-tabs" aria-label="任务明细">
+    <a class="button button-secondary" th:attr="aria-current=${view == 'files' ? 'page' : null}" th:href="@{/tasks/{id}(id=${task.id},view='files')}">文件</a>
+    <a class="button button-secondary" th:attr="aria-current=${view == 'units' ? 'page' : null}" th:href="@{/tasks/{id}(id=${task.id},view='units')}" th:text="${task.direction == 'PUSH' ? '产品' : '拉取单元'}"></a>
+    <a class="button button-secondary" th:attr="aria-current=${view == 'timeline' ? 'page' : null}" th:href="@{/tasks/{id}(id=${task.id},view='timeline')}">通知、回执与操作</a>
+  </nav>
+  <section class="panel">
+    <p th:if="${#lists.isEmpty(rows)}">暂无明细。</p>
+    <article class="console-detail" th:each="row : ${rows}">
+      <div th:if="${view == 'files'}">
+        <h3 th:text="${row.relative_path}"></h3>
+        <p th:text="|${task.direction == 'PUSH' ? row.product_id : row.transfer_id} · ${row.effective_bytes}/${row.size_bytes} 字节 · ${row.verified ? '已验证' : '未验证'}|"></p>
+        <p th:if="${row.expected_hash != null}">预期 SHA-256 <code th:text="${row.expected_hash}"></code></p>
+        <p th:if="${row['actual_hash'] != null}">实际 SHA-256 <code th:text="${row['actual_hash']}"></code></p>
+      </div>
+      <div th:if="${view == 'units' && task.direction == 'PUSH'}">
+        <h3 th:text="${row.product_name ?: row.product_id}"></h3><p th:text="|${row.product_id} · ${row.product_path}|"></p>
+      </div>
+      <div th:if="${view == 'units' && task.direction == 'PULL'}">
+        <h3 th:text="${row.source_path}"></h3>
+        <p th:text="|${row.status ?: row.unit_status} · 验收 ${row.acceptance_status ?: '未开始'} · ${row.error_type ?: (row.unit_error ?: '无错误')}|"></p>
+        <p th:if="${row.transfer_id != null}" th:text="|交付 ${row.transfer_id} · ${row.version_basis} · 版本 ${row.source_version}|"></p>
+        <p th:if="${row.data_location != null}" th:text="|发布于 ${row.published_at} · ${row.data_location}|"></p>
+        <p th:if="${row.acceptance_reason != null}" th:text="${row.acceptance_reason}"></p>
+      </div>
+      <div th:if="${view == 'timeline'}">
+        <h3 th:text="|${row.kind} · ${row.event}|"></h3>
+        <p th:text="|${row.happened} · ${row.status} · ${row.id}|"></p>
+        <p th:if="${row.transfer_id != null}" th:text="|交付 ${row.transfer_id}|"></p>
+        <p th:if="${row.reason != null}" th:text="${row.reason}"></p>
+        <p th:if="${row.kind == 'NOTICE'}" th:text="|发送尝试 ${row.attempts}|"></p>
+        <form method="post" th:if="${row.kind == 'NOTICE' && (row.status == 'NEEDS_ATTENTION' || row.status == 'RETRY_WAIT')}"
+              th:action="@{/tasks/{id}/notifications/{notice}/resend(id=${task.id},notice=${row.id})}">
+          <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="nonce" th:value="${operationNonce}">
+          <button class="button-secondary">补发原通知</button>
+        </form>
+      </div>
+    </article>
+  </section>
+  <nav class="actions" aria-label="明细分页">
+    <a class="button button-secondary" th:if="${page > 0}" th:href="@{/tasks/{id}(id=${task.id},view=${view},page=${page - 1})}">上一页</a>
+    <span th:text="|第 ${page + 1} 页|"></span>
+    <a class="button button-secondary" th:if="${more}" th:href="@{/tasks/{id}(id=${task.id},view=${view},page=${page + 1})}">下一页</a>
+  </nav>
+</main>
+</body>
+</html>

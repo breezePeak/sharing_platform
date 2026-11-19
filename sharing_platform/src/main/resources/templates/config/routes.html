@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>来源与路由 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header">
+    <h1>来源与路由</h1>
+    <div class="actions">
+      <a class="button button-secondary" th:href="@{/config/endpoints}">连接配置</a>
+      <a class="button button-secondary" th:href="@{/config/listeners}">监听配置</a>
+    </div>
+  </div>
+  <p class="field-hint">来源、路由和通知绑定由部署方维护在外置配置中。</p>
+  <section class="panel">
+    <h2>拉取来源</h2>
+    <p th:if="${#lists.isEmpty(sources)}">暂无已配置来源。</p>
+    <article class="console-detail" th:each="source : ${sources}">
+      <h3 th:text="${source.id}"></h3>
+      <p th:text="|${source.path} · ${source.unit} · ${source.validation} · 保存快照 ${source.revisions} 个|"></p>
+      <p th:text="|目标 ${source.target} · 接收方 ${source.recipient} · 授权 ${source.callers}|"></p>
+      <p th:text="${source.valid ? '配置校验通过' : '配置待修正'}"></p>
+    </article>
+  </section>
+  <section class="panel">
+    <h2>推送路由</h2>
+    <p th:if="${#lists.isEmpty(routes)}">暂无已配置路由。</p>
+    <article class="console-detail" th:each="route : ${routes}">
+      <h3 th:text="|${route.caller} / ${route.type}|"></h3>
+      <p th:text="|版本 ${route.version} · ${route.enabled ? '启用' : '停用'} · 连接 ${route.endpoint}|"></p>
+      <p th:text="|本地源 ${route.source} · 远端目标 ${route.target} · 通知 ${route.configured ? '已配置' : '待配置'}|"></p>
+    </article>
+  </section>
+  <section class="panel">
+    <h2>通知绑定</h2>
+    <p th:if="${#lists.isEmpty(recipients)}">暂无调用方。</p>
+    <p th:each="recipient : ${recipients}" th:text="|${recipient.caller} · ${recipient.configured ? '已配置通知' : '待配置通知'} · 连接 ${recipient.endpoints}|"></p>
+  </section>
+</main>
+</body>
+</html>

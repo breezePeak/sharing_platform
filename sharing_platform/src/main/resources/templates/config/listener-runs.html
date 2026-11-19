@@ -36,7 +36,7 @@
     <h2 th:text="${runs == null ? '扫描关联任务' : '引用本监听的 API 任务'}"></h2>
     <p th:if="${#lists.isEmpty(tasks)}">暂无关联任务。</p>
     <article class="panel" th:each="task : ${tasks}">
-      <h3 th:text="${task.external_task_id}"></h3>
+      <h3><a th:href="@{/tasks/{id}(id=${task.id})}" th:text="${task.external_task_id}"></a></h3>
       <p>任务记录 <code th:text="${task.id}"></code></p>
       <p th:text="|${task.trigger_type} · 执行 ${task.status} · 验收 ${task.acceptance_status}|"></p>
       <p th:if="${task.error_type != null}" th:text="${task.error_type}"></p>

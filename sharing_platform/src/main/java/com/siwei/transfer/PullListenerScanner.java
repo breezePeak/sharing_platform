@@ -54,7 +54,9 @@ public class PullListenerScanner {
     }
 
     @Scheduled(fixedDelay = 1000)
-    public synchronized void poll() {
+    public void poll() { dispatch(); }
+
+    public synchronized void dispatch() {
         if (!settings.isIntakeEnabled()) return;
         Timestamp now = Timestamp.from(clock.instant());
         recover(now);

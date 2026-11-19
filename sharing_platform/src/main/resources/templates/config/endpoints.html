@@ -16,6 +16,7 @@
     </div>
     <div class="actions">
       <a class="button button-secondary" th:href="@{/config/listeners}">拉取监听</a>
+      <a class="button button-secondary" th:href="@{/config/routes}">来源与路由</a>
       <a class="button" th:href="@{/config/endpoints/new}">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
@@ -81,11 +82,18 @@
         <a class="button button-secondary" th:href="@{/config/endpoints/{id}(id=${row.id})}">编辑配置</a>
         <form method="post" th:action="@{/config/endpoints/{id}/toggle(id=${row.id})}">
           <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="nonce" th:value="${operationNonce}">
           <input type="hidden" name="revision" th:value="${row.revision}">
-          <button class="button-secondary" th:text="${row.enabled ? '停用' : '启用'}">停用</button>
+          <button class="button-secondary" th:if="${!row.enabled}">启用</button>
+          <details th:if="${row.enabled}">
+            <summary>停用连接</summary>
+            <p>停止接收新任务，在途任务按原快照继续。</p>
+            <button class="button-secondary">确认停用</button>
+          </details>
         </form>
         <form method="post" th:action="@{/config/endpoints/{id}/probe(id=${row.id})}">
           <input type="hidden" name="_csrf" th:value="${csrfToken}">
+          <input type="hidden" name="nonce" th:value="${operationNonce}">
           <input type="hidden" name="revision" th:value="${row.revision}">
           <button th:disabled="${!row.enabled}">检测能力</button>
         </form>

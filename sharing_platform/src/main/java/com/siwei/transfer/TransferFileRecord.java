@@ -16,6 +16,7 @@ public class TransferFileRecord {
     @Column(name = "sha256") public String sha;
     @Column(name = "source_modified_millis") public long modifiedMillis;
     @Column(name = "uploaded_bytes") public long uploadedBytes;
+    @Column(name = "effective_uploaded_bytes") public long effectiveUploadedBytes;
     @Column(name = "upload_traffic_bytes") public long uploadTrafficBytes;
     @Column(name = "readback_bytes") public long readbackBytes;
     public boolean verified;

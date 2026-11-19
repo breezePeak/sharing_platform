@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>当前服务 · 数据共享平台</title>
+  <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<header th:replace="~{fragments :: navigation}"></header>
+<main>
+  <div class="page-header">
+    <h1>当前服务</h1>
+    <div class="actions">
+      <a class="button button-secondary" th:href="@{/config/endpoints}">连接配置</a>
+      <a class="button button-secondary" th:href="@{/config/listeners}">监听配置</a>
+    </div>
+  </div>
+  <section class="empty" th:if="${#lists.isEmpty(services)}"><h2>暂无配置服务</h2></section>
+  <article class="endpoint-card" th:each="service : ${services}">
+    <div class="endpoint-card-header">
+      <div>
+        <div class="endpoint-title-row">
+          <span class="badge badge-protocol" th:text="${service.protocol}"></span>
+          <h2 th:text="${service.name}"></h2>
+          <span th:class="${service.enabled ? 'badge badge-enabled' : 'badge badge-disabled'}"
+                th:text="${service.enabled ? '已启用' : '已停用'}"></span>
+        </div>
+        <p class="endpoint-meta" th:text="|${service.host} · 端口 ${service.port} · 配置版本 ${service.revision}|"></p>
+      </div>
+      <div class="actions">
+        <a class="button button-secondary" th:href="@{/config/endpoints/{id}(id=${service.id})}">编辑</a>
+        <a class="button button-secondary" th:href="@{/tasks(endpoint=${service.id})}">关联任务</a>
+      </div>
+    </div>
+    <div class="probe-section">
+      <p th:if="${service.probe_status == null}">连接观测未知，尚无检测记录</p>
+      <div th:if="${service.probe_status != null}">
+        <p><strong th:text="${service.probe_status}"></strong>
+          <span th:if="${service.stale}"> · 旧配置或超过 15 分钟的观测</span>
+          <time th:text="${service.finished_at ?: service.started_at}"></time></p>
+        <p th:text="|读取 ${service.can_read} · 写入 ${service.can_write} · 完整性 ${service.verified} · 改名 ${service.can_rename}|"></p>
+        <pre th:if="${!#strings.isEmpty(service.details)}" th:text="${service.details}"></pre>
+      </div>
+      <h3>拉取监听</h3>
+      <p th:if="${#lists.isEmpty(service.listeners)}">暂无监听</p>
+      <div class="console-listener" th:each="listener : ${service.listeners}">
+        <a th:href="@{/config/listeners/{id}/runs(id=${listener.id})}" th:text="${listener.name}"></a>
+        <span th:text="|${listener.enabled ? '启用' : '停用'} · ${listener.run_status ?: '尚未扫描'} · ${listener.source_path}|"></span>
+        <p th:if="${listener.started_at != null}"
+           th:text="|最近 ${listener.started_at} · 候选 ${listener.candidate_count} · 新建 ${listener.created_count} · 复用 ${listener.reused_count}|"></p>
+        <p th:if="${listener.enabled && service.enabled}" th:text="|计划 ${listener.next_run_at}|"></p>
+        <p th:if="${listener.error_type != null}" th:text="${listener.error_type}"></p>
+      </div>
+    </div>
+  </article>
+</main>
+</body>
+</html>

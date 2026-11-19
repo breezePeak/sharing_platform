@@ -57,6 +57,7 @@ public class PullStore {
         if (claim == null || !claim.equals(delivery.get("claim_id"))) throw new IllegalStateException("DELIVERY_CLAIM_LOST");
         if (update("UPDATE pull_file SET downloaded_bytes=?,actual_hash=?,verified=? WHERE transfer_id=? AND relative_path=?", downloaded, hash, verified, transfer, path) != 1)
             throw new IllegalStateException("FILE_NOT_FOUND");
+        update("UPDATE pull_transfer SET current_file=? WHERE id=?", path, transfer);
     }
 
     // Recompute under the task row lock so a worker's late result cannot undo a receipt.
@@ -81,7 +82,7 @@ public class PullStore {
             update("UPDATE transfer_task SET acceptance_status=?,updated_at=now() WHERE id=?", acceptance, task);
             return;
         }
-        update("UPDATE transfer_task SET status=?,phase=?,acceptance_status=?,error_type=?,error_detail=NULL,next_run_at=now()+(? * interval '1 second'),attempts=0,claim_id=NULL,claimed_at=NULL,updated_at=now(),version=version+1 WHERE id=?",
-                state, state, acceptance, error, delaySeconds, task);
+        update("UPDATE transfer_task SET status=?,phase=?,acceptance_status=?,error_type=?,error_detail=NULL,next_run_at=now()+(? * interval '1 second'),attempts=0,claim_id=NULL,claimed_at=NULL,updated_at=now(),version=version+1,read_only_recheck=read_only_recheck AND NOT ? WHERE id=?",
+                state, state, acceptance, error, delaySeconds, claim != null, task);
     }
 }

@@ -39,7 +39,7 @@ public class PullProcessor implements TaskProcessor {
     @Override public String direction() { return "PULL"; }
 
     @Override public Result process(Task task) throws Exception {
-        var record = db.one("SELECT pull_config,pull_scan_complete,claim_id,listener_id FROM transfer_task WHERE id=?", task.taskRecordId);
+        var record = db.one("SELECT pull_config,pull_scan_complete,claim_id,listener_id,read_only_recheck FROM transfer_task WHERE id=?", task.taskRecordId);
         JsonNode config = json.readTree((String) record.get("pull_config"));
         EndpointRevision endpoint = revisions.findById(task.endpointRevisionId).orElseThrow();
         String scope = ControlledPaths.resolve(endpoint.readRoot, config.path("requestPath")
@@ -48,6 +48,14 @@ public class PullProcessor implements TaskProcessor {
         String claim = (String) record.get("claim_id");
         if (claim == null || !claim.equals(task.claimId)) throw new IllegalStateException("TASK_NOT_CLAIMED");
         List<Map<String, Object>> units = db.rows("SELECT * FROM pull_task_unit WHERE task_id=? ORDER BY source_path", task.taskRecordId);
+        if (Boolean.TRUE.equals(record.get("read_only_recheck"))) {
+            for (var unit : units) {
+                String id = (String) unit.get("transfer_id");
+                if (id != null && "PUBLISHING".equals(transfer(id).get("status")))
+                    execute(null, task, id, claim, endpoint.concurrency, true);
+            }
+            return waiting();
+        }
         boolean needsRemote = !(Boolean) record.get("pull_scan_complete") || units.stream().anyMatch(u -> u.get("transfer_id") == null && !"FAILED".equals(u.get("status")));
         boolean workNeeded = needsRemote;
         for (var unit : units) if (unit.get("transfer_id") != null) {
@@ -97,7 +105,7 @@ public class PullProcessor implements TaskProcessor {
                     }
                 }
                 if (transfer != null && task.endpointRevisionId.equals(transfer(transfer).get("owner_revision")))
-                    execute(remote, task, transfer, claim, endpoint.concurrency);
+                    execute(remote, task, transfer, claim, endpoint.concurrency, false);
             }
         }
         remind(task.taskRecordId, config.path("acceptanceSeconds").asInt());
@@ -359,12 +367,14 @@ public class PullProcessor implements TaskProcessor {
         Version(String key, String hash, String basis) { this.key = key; this.hash = hash; this.basis = basis; }
     }
 
-    private void execute(RemoteFileClient remote, Task task, String id, String claim, int concurrency) throws Exception {
+    private void execute(RemoteFileClient remote, Task task, String id, String claim, int concurrency, boolean readOnly) throws Exception {
         boolean acquired = tx.execute(status -> {
             db.one("SELECT id FROM endpoint WHERE id=? FOR UPDATE", task.endpointId);
             long active = ((Number) db.one("SELECT count(*) AS n FROM pull_transfer WHERE endpoint_id=? AND claim_id IS NOT NULL AND claimed_at>now()-interval '5 minutes'", task.endpointId).get("n")).longValue();
             if (active >= concurrency) return false;
-            return db.update("UPDATE pull_transfer SET claim_id=?,claimed_at=now(),attempts=attempts+1 WHERE id=? AND status IN ('DOWNLOADING','PUBLISHING') AND next_run_at<=now() AND (claim_id IS NULL OR claimed_at<now()-interval '5 minutes')", claim, id) == 1;
+            return db.update("UPDATE pull_transfer SET claim_id=?,claimed_at=now(),attempts=attempts+1 WHERE id=? "
+                    + "AND ((? AND status='PUBLISHING' AND publish_intent) OR (NOT ? AND status IN ('DOWNLOADING','PUBLISHING') AND next_run_at<=now())) "
+                    + "AND (claim_id IS NULL OR claimed_at<now()-interval '5 minutes')", claim, id, readOnly, readOnly) == 1;
         });
         if (!acquired) return;
         try {
@@ -372,18 +382,26 @@ public class PullProcessor implements TaskProcessor {
             JsonNode config = json.readTree((String) transfer.get("config"));
             JsonNode observation = json.readTree((String) transfer.get("observation"));
             Path root = ControlledPaths.localDirectory(config.path("localRoot").asText());
-            Path temporary = directory(directory(root, "tmp"), id);
-            Path pending = directory(root, "pending").resolve(id);
-            if (!(Boolean) transfer.get("publish_intent")) {
-                if (!observe(remote, (String) transfer.get("source_path"), config).toString().equals(observation.toString())) throw new Changed();
-                download(remote, transfer, config, observation, temporary, claim);
-                if (!observe(remote, (String) transfer.get("source_path"), config).toString().equals(observation.toString())) throw new Changed();
-                if (db.update("UPDATE pull_transfer SET publish_intent=true,status='PUBLISHING' WHERE id=? AND claim_id=?", id, claim) != 1)
-                    throw new IllegalStateException("DELIVERY_CLAIM_LOST");
+            Path pending = root.resolve("pending").resolve(id);
+            if (readOnly) {
+                Path marker = pending.resolve(".sharing-complete");
+                ControlledPaths.localDirectory(pending.toString());
+                verifyMarker(marker, completionMarker(id, observation));
+                verifyLocal(id, pending, observation);
+            } else {
+                Path temporary = directory(directory(root, "tmp"), id);
+                directory(root, "pending");
+                if (!(Boolean) transfer.get("publish_intent")) {
+                    if (!observe(remote, (String) transfer.get("source_path"), config).toString().equals(observation.toString())) throw new Changed();
+                    download(remote, transfer, config, observation, temporary, claim);
+                    if (!observe(remote, (String) transfer.get("source_path"), config).toString().equals(observation.toString())) throw new Changed();
+                    if (db.update("UPDATE pull_transfer SET publish_intent=true,status='PUBLISHING' WHERE id=? AND claim_id=?", id, claim) != 1)
+                        throw new IllegalStateException("DELIVERY_CLAIM_LOST");
+                }
+                publish(id, temporary, pending, observation);
             }
-            publish(id, temporary, pending, observation);
             tx.executeWithoutResult(status -> {
-                if (db.update("UPDATE pull_transfer SET status='PUBLISHED',acceptance_status='PENDING',published_at=now(),data_location=?,claim_id=NULL,claimed_at=NULL,error_type=NULL WHERE id=? AND claim_id=?",
+                if (db.update("UPDATE pull_transfer SET status='PUBLISHED',acceptance_status='PENDING',published_at=now(),data_location=?,claim_id=NULL,claimed_at=NULL,error_type=NULL,current_file=NULL WHERE id=? AND claim_id=?",
                         location(config, id), id, claim) != 1) throw new IllegalStateException("DELIVERY_CLAIM_LOST");
                 notification(id, true, null);
             });
@@ -418,7 +436,9 @@ public class PullProcessor implements TaskProcessor {
                     && Files.size(path) == f.path("size").asLong() && digest(path).equals(previous.get("actual_hash"))) continue;
             db.fileProgress(id, f.path("path").asText(), claim, 0, null, false);
             // A retry replaces only this transfer's unexposed partial file and checks its whole content again.
-            try (OutputStream output = Files.newOutputStream(path, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS)) {
+            try (DownloadProgress output = new DownloadProgress(Files.newOutputStream(path,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS),
+                    id, f.path("path").asText(), claim, f.path("size").asLong())) {
                 remote.read(config.path("unitType").asText().equals("FILE") ? source : source + "/" + f.path("path").asText(), output);
             }
             long size = Files.size(path);
@@ -430,9 +450,45 @@ public class PullProcessor implements TaskProcessor {
             db.fileProgress(id, f.path("path").asText(), claim, size, actual, true);
         }
     }
+
+    private final class DownloadProgress extends FilterOutputStream {
+        private final String transfer, path, claim;
+        private final long size;
+        private long bytes, saved, sampled = System.nanoTime();
+
+        DownloadProgress(OutputStream stream, String transfer, String path, String claim, long size) {
+            super(stream);
+            this.transfer = transfer; this.path = path; this.claim = claim; this.size = size;
+        }
+
+        @Override public void write(int value) throws IOException {
+            out.write(value);
+            bytes++;
+            checkpoint(false);
+        }
+
+        @Override public void write(byte[] data, int offset, int length) throws IOException {
+            out.write(data, offset, length);
+            bytes += length;
+            checkpoint(false);
+        }
+
+        private void checkpoint(boolean force) {
+            long now = System.nanoTime();
+            if (bytes != saved && (force || bytes - saved >= 8L * 1024 * 1024 || now - sampled >= 1_000_000_000)) {
+                db.fileProgress(transfer, path, claim, Math.min(bytes, size), null, false);
+                sampled = now;
+                saved = bytes;
+            }
+        }
+
+        @Override public void close() throws IOException {
+            try { out.close(); } finally { checkpoint(true); }
+        }
+    }
     private void publish(String id, Path temporary, Path pending, JsonNode observation) throws IOException {
         Path marker = pending.resolve(".sharing-complete");
-        byte[] content = (id + "\n" + TaskWorker.sha256(observation.toString()) + "\n").getBytes(StandardCharsets.UTF_8);
+        byte[] content = completionMarker(id, observation);
         if (Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
             verifyLocal(id, pending, observation); verifyMarker(marker, content); return;
         }
@@ -459,6 +515,10 @@ public class PullProcessor implements TaskProcessor {
             verifyLocal(id, pending, observation);
         }
         Files.write(marker, content, StandardOpenOption.CREATE_NEW, LinkOption.NOFOLLOW_LINKS);
+    }
+
+    private static byte[] completionMarker(String id, JsonNode observation) {
+        return (id + "\n" + TaskWorker.sha256(observation.toString()) + "\n").getBytes(StandardCharsets.UTF_8);
     }
     private static void verifyMarker(Path marker, byte[] content) throws IOException {
         if (!Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS) || Files.size(marker) != content.length

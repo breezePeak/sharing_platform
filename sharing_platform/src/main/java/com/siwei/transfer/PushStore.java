@@ -46,6 +46,11 @@ public class PushStore {
         record.pushManifestSha256 = digest; record.pushTargetRoot = target; record.pushManifest = manifest;
     }
     public void phase(Task task, String phase) { executing(task).phase = phase; }
+    public void uploadStarted(Task task, TransferFileRecord file) {
+        TransferTaskRecord record = executing(task);
+        record.currentFile = file.product + "/" + file.path;
+        files.findById(new TransferPathId(task.taskRecordId, file.product, file.path)).orElseThrow().effectiveUploadedBytes = 0;
+    }
     public void manifestIntent(Task task) {
         TransferTaskRecord record = executing(task); record.pushManifestIntent = true; record.phase = "PUBLISHING";
     }
@@ -56,7 +61,13 @@ public class PushStore {
         TransferTaskRecord record = executing(task);
         TransferFileRecord current = files.findById(new TransferPathId(task.taskRecordId, file.product, file.path)).orElseThrow();
         current.uploadedBytes = Math.max(current.uploadedBytes, Math.min(file.size, uploaded));
+        record.currentFile = file.product + "/" + file.path;
+        if (traffic > 0) current.effectiveUploadedBytes = Math.min(file.size, uploaded);
         current.uploadTrafficBytes += traffic; current.readbackBytes += readback;
-        if (verified) { current.verified = true; current.uploadedBytes = current.size; record.attempts = 1; }
+        if (verified) {
+            current.verified = true;
+            current.effectiveUploadedBytes = current.uploadedBytes = current.size;
+            record.attempts = 1;
+        }
     }
 }

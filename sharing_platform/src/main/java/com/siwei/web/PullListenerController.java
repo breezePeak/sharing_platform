@@ -12,11 +12,17 @@ import org.springframework.web.servlet.ModelAndView;
 @RequestMapping("/config/listeners")
 public class PullListenerController {
     private final PullListenerService listeners;
+    private final ConsoleOperations operations;
 
-    public PullListenerController(PullListenerService listeners) { this.listeners = listeners; }
+    public PullListenerController(PullListenerService listeners, ConsoleOperations operations) {
+        this.listeners = listeners; this.operations = operations;
+    }
 
     @ModelAttribute("csrfToken")
     Object csrf(HttpServletRequest request) { return request.getSession().getAttribute(EndpointCsrfFilter.TOKEN); }
+
+    @ModelAttribute("operationNonce")
+    String nonce() { return java.util.UUID.randomUUID().toString(); }
 
     @GetMapping
     String list(Model model) {
@@ -41,14 +47,25 @@ public class PullListenerController {
     }
 
     @PostMapping("/{id}/toggle")
-    String toggle(@PathVariable String id, @RequestParam int editVersion) {
-        listeners.toggle(id, editVersion);
+    String toggle(@PathVariable String id, @RequestParam int editVersion, @RequestParam(required = false) String nonce,
+                  HttpServletRequest request) {
+        boolean enabled = Boolean.TRUE.equals(listeners.form(id).get("enabled"));
+        operations.run((String) request.getAttribute(EndpointCsrfFilter.ACTOR), id, "LISTENER_TOGGLE",
+                nonce == null ? nonce() : nonce, enabled ? "ENABLED" : "DISABLED", () -> {
+                    listeners.toggle(id, editVersion);
+                    return enabled ? "DISABLED" : "ENABLED";
+                });
         return "redirect:/config/listeners";
     }
 
     @PostMapping("/{id}/run")
-    String run(@PathVariable String id) {
-        listeners.manual(id);
+    String run(@PathVariable String id, @RequestParam(required = false) String nonce, HttpServletRequest request) {
+        boolean pending = Boolean.TRUE.equals(listeners.form(id).get("manual_pending"));
+        operations.run((String) request.getAttribute(EndpointCsrfFilter.ACTOR), id, "LISTENER_RUN",
+                nonce == null ? nonce() : nonce, pending ? "MANUAL_QUEUED" : "IDLE", () -> {
+                    listeners.manual(id);
+                    return Boolean.TRUE.equals(listeners.form(id).get("manual_pending")) ? "MANUAL_QUEUED" : "MANUAL_COALESCED";
+                });
         return "redirect:/config/listeners/" + id + "/runs";
     }
 
